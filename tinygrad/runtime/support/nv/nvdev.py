@@ -3,7 +3,7 @@ import time, functools, tinygrad.runtime.autogen.nv_regs
 from tinygrad.helpers import getenv, DEBUG, getbits, round_up
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
-from tinygrad.runtime.support.nv.ip import NV_FLCN, NV_FLCN_COT, NV_GSP
+from tinygrad.runtime.support.nv.ip import NV_FLCN, NV_FLCN_COT, NV_GSP, find_vbios_rom_offset
 from tinygrad.runtime.support.system import PCIDevice
 from tinygrad.runtime.support.hcq import MMIOInterface
 
@@ -63,6 +63,7 @@ class NVPageTableEntry:
     return self.read_fields(entry_id)['aperture_small' if self._is_dual_pde() else 'aperture'] != 0
 
   def address(self, entry_id:int) -> int:
+    if self.is_page(entry_id): return self.read_fields(entry_id)['address_sys'] << 12
     small, sys = ("_small" if self._is_dual_pde() else ""), "_sys" if self.nvdev.mmu_ver == 2 or self.lv == self.nvdev.mm.level_cnt - 1 else ""
     return self.read_fields(entry_id)[f'address{small}{sys}'] << 12
 
@@ -72,6 +73,8 @@ class NVMemoryManager(MemoryManager):
   def on_range_mapped(self): self.dev.NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE.write((1 << 0) | (1 << 1) | (1 << 6) | (1 << 31))
 
 class NVDev:
+  _VBIOS_BASE = 0x00300000
+
   def __init__(self, pci_dev:PCIDevice):
     self.pci_dev, self.devfmt, self.mmio = pci_dev, pci_dev.pcibus, pci_dev.map_bar(0, fmt='I')
 
@@ -94,6 +97,25 @@ class NVDev:
     if NV_DEBUG >= 4: print(f"wreg: {hex(addr)} = {hex(value)}")
   def rreg(self, addr:int) -> int: return self.mmio[addr // 4]
 
+  def _usb_vbios_available(self) -> bool:
+    try: find_vbios_rom_offset(lambda off: self.mmio[(self._VBIOS_BASE + off) // 4])
+    except ValueError: return False
+    return True
+
+  def _reset_stale_state(self):
+    wpr2_up = self.reg("NV_PFB_PRI_MMU_WPR2_ADDR_HI").read() != 0
+    usb_vbios_missing = getattr(self.pci_dev, "boot_mem_in_vram", False) and not self._usb_vbios_available()
+    if not wpr2_up and not usb_vbios_missing: return
+
+    self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
+    if DEBUG >= 2:
+      reasons = ", ".join(reason for condition, reason in ((wpr2_up, "WPR2 is up"), (usb_vbios_missing, "VBIOS is unavailable")) if condition)
+      print(f"nv {self.devfmt}: {reasons}. Issuing a full reset.", flush=True)
+    self.pci_dev.reset()
+    time.sleep(0.1) # wait until device can respond again
+    if usb_vbios_missing and not self._usb_vbios_available():
+      raise RuntimeError("NVIDIA USB reset completed but VBIOS is still unavailable; physically power-cycle the GPU and UT3G")
+
   def _early_ip_init(self):
     self.reg_names:set[str] = set()
     self.reg_offsets:dict[str, tuple[int, int]] = {}
@@ -102,11 +124,7 @@ class NVDev:
     self.include("dev_fb", "tu102")
     self.include("dev_gc6_island", "ga102")
 
-    if self.reg("NV_PFB_PRI_MMU_WPR2_ADDR_HI").read() != 0:
-      self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
-      if DEBUG >= 2: print(f"nv {self.devfmt}: WPR2 is up. Issuing a full reset.", flush=True)
-      self.pci_dev.reset()
-      time.sleep(0.1) # wait until device can respond again
+    self._reset_stale_state()
 
     self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
     self.chip_id = self.reg("NV_PMC_BOOT_0").read()
@@ -143,18 +161,22 @@ class NVDev:
     bits, shifts = (56, [12, 21, 29, 38, 47, 56]) if self.mmu_ver == 3 else (48, [12, 21, 29, 38, 47])
 
     # tail vram reserved for falcon structs
+    cpu_visible_limit = self.pci_dev.bar_info(1)[1] if getattr(self.pci_dev, "boot_mem_in_vram", False) else None
     self.mm = NVMemoryManager(self, self.vram_size - (64 << 20), boot_size=(2 << 20), pt_t=NVPageTableEntry, va_bits=bits, va_shifts=shifts,
-      va_base=0, palloc_ranges=[(x, x) for x in [512 << 20, 2 << 20, 4 << 10]], reserve_ptable=not self.large_bar)
+      va_base=0, palloc_ranges=[(x, x) for x in [512 << 20, 2 << 20, 4 << 10]], reserve_ptable=not self.large_bar,
+      cpu_visible_limit=cpu_visible_limit)
 
   def _alloc_boot_mem(self, size:int, data:bytes|None=None, contiguous:bool=False, sysmem:bool|None=None) -> tuple[MMIOInterface,int|None,list[int]]:
     sz = round_up(size, 0x1000)
-    if sysmem is True or (sysmem is None and not self.large_bar):
+    if sysmem is True or (sysmem is None and not self.large_bar and not getattr(self.pci_dev, "boot_mem_in_vram", False)):
       view, sysaddr = self.pci_dev.alloc_sysmem(size, 0, contiguous=contiguous)
       paddr = None
     else:
-      paddr = self.mm.palloc(sz, boot=False)
+      cpu_visible = getattr(self.pci_dev, "boot_mem_in_vram", False)
+      paddr = self.mm.palloc(sz, boot=False, cpu_visible=cpu_visible)
       view = self.vram.view(paddr, sz)
-      sysaddr = [self.pci_dev.bar_info(1)[0] + paddr + i * 0x1000 for i in range(sz // 0x1000)]
+      base = paddr if cpu_visible else self.pci_dev.bar_info(1)[0] + paddr
+      sysaddr = [base + i * 0x1000 for i in range(sz // 0x1000)]
     if data is not None: view[:size] = data
     return view, paddr, sysaddr
 
