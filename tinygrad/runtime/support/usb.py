@@ -1,3 +1,4 @@
+from __future__ import annotations
 import ctypes, struct, time, functools, itertools
 from tinygrad.runtime.autogen import libusb
 from tinygrad.helpers import DEBUG, DEV, to_mv, round_up, ceildiv
@@ -66,7 +67,7 @@ class USB3:
     assert checked(libusb.libusb_control_transfer)(self.handle, 0xC0, request, value, index, self._ctrl_buf, length, timeout) == length
     return self._ctrl_mv[:length]
 
-  def bulk_write(self, payload:bytes, timeout:int=1000):
+  def bulk_write(self, payload:bytes|memoryview, timeout:int=1000):
     if len(payload) > len(self._bulk_mv): self._bulk_buf, self._bulk_mv = alloc_cbuffer(len(payload))
     self._bulk_mv[:len(payload)] = payload
     checked(libusb.libusb_bulk_transfer, "bulk OUT 0x02 failed") \
@@ -87,16 +88,51 @@ class USB3:
       assert (sig, rtag, status) == (0x53425355, tag, 0)
 
 class CustomASM24Controller:
-  def __init__(self, usb:USB3):
+  PCIE_BULK_CHUNK_SIZE = 1 << 20
+  GSP_RING_PAGE, GSP_RING_PAGES, GSP_STREAM_BATCH_PAGES = 44, 84, 28
+  GSP_STREAM_FIRST_WRITE, GSP_STREAM_PERIOD = 0.003, 0.0014
+  FW_INFO_STRUCT, FW_PROTOCOL_MAJOR = struct.Struct("<4sBBHII"), 1
+  FW_CAP_XDATA, FW_CAP_PCIE_TLP, FW_CAP_SRAM_DMA = 1 << 0, 1 << 1, 1 << 2
+  FW_CAP_PCIE_POWER, FW_CAP_PCIE_POWER_POST_TRAIN, FW_CAP_USB3_DIRECT = 1 << 3, 1 << 4, 1 << 6
+  FW_REQUIRED_CAPABILITIES = FW_CAP_XDATA | FW_CAP_PCIE_TLP | FW_CAP_SRAM_DMA | FW_CAP_PCIE_POWER | FW_CAP_PCIE_POWER_POST_TRAIN | FW_CAP_USB3_DIRECT
+
+  def __init__(self, usb:USB3, minimum_revision:int|None=None):
     self.usb = usb
+    self.firmware_protocol:tuple[int, int]|None = None
+    self.firmware_capabilities:int|None = None
+    self.firmware_revision:int|None = None
+    if minimum_revision is not None:
+      self.firmware_protocol, self.firmware_capabilities, self.firmware_revision = self._read_firmware_info(minimum_revision)
 
     # Custom firmware now boots with PCIe off. Power it on before probing the link.
     ltssm = self.read(0xB450, 1)[0]
-    if ltssm != 0x78: self.set_pcie_power(True)
-    ltssm = self.read(0xB450, 1)[0]
-    if ltssm != 0x78: raise RuntimeError(f"PCIe link not up (LTSSM=0x{ltssm:02X}), custom firmware not ready")
+    if ltssm != 0x78:
+      self.set_pcie_power(True)
+      self.wait_for_pcie_link()
+
+  def _read_firmware_info(self, minimum_revision:int) -> tuple[tuple[int, int], int, int]:
+    try: raw = bytes(self.usb.control_read(0xF4, self.FW_INFO_STRUCT.size))
+    except (AssertionError, RuntimeError) as exc:
+      raise RuntimeError(f"Incompatible custom ASM24 firmware: request 0xF4 failed; flash revision {minimum_revision} or newer") from exc
+    if len(raw) != self.FW_INFO_STRUCT.size:
+      raise RuntimeError(f"Incompatible custom ASM24 firmware: malformed 0xF4 record ({len(raw)} bytes)")
+    magic, major, minor, info_size, capabilities, revision = self.FW_INFO_STRUCT.unpack(raw)
+    if magic != b"TG24" or info_size < self.FW_INFO_STRUCT.size:
+      raise RuntimeError(f"Incompatible custom ASM24 firmware information: magic={magic!r}, size={info_size}")
+    if major != self.FW_PROTOCOL_MAJOR:
+      raise RuntimeError(f"Unsupported custom ASM24 firmware protocol {major}.{minor}; expected {self.FW_PROTOCOL_MAJOR}.x")
+    if (missing:=self.FW_REQUIRED_CAPABILITIES & ~capabilities):
+      raise RuntimeError(f"Custom ASM24 firmware is missing required capabilities {missing:#x}")
+    if revision < minimum_revision:
+      raise RuntimeError(f"Custom ASM24 firmware revision {revision} is too old; revision {minimum_revision} or newer is required")
+    return (major, minor), capabilities, revision
 
   def set_pcie_power(self, enabled:bool, timeout:int=10000): self.usb.control_write(0xF3, value=int(enabled), timeout=timeout)
+
+  def wait_for_pcie_link(self, timeout:float=10.0):
+    deadline = time.monotonic() + timeout
+    while (ltssm:=self.read(0xB450, 1)[0]) != 0x78 and time.monotonic() < deadline: time.sleep(0.01)
+    if ltssm != 0x78: raise RuntimeError(f"PCIe link not up (LTSSM=0x{ltssm:02X}), custom firmware not ready")
 
   def _f0_out(self, fmt_type:int, byte_en:int, address:int, value:int, mode:int=0):
     self.usb.control_write(0xF0, fmt_type | (byte_en << 8), mode & 0x03, struct.pack('<III', address & 0xFFFFFFFF, address >> 32, value), 5000)
@@ -139,13 +175,28 @@ class CustomASM24Controller:
     """Streaming PCIe memory write via 0xF0 mode 1 + bulk OUT. Data is little-endian dwords on the wire."""
     if not data: return
     assert len(data) % 4 == 0, f"pcie_mem_write requires 4-byte aligned size, got {len(data)}"
-    self._f0_out(0x60, 0x0F, address, len(data) // 4, mode=1)
-    self.usb.bulk_write(data)
+    assert address >= 0 and (address >> 32 or address + len(data) <= (1 << 32)), "PCIe transfer crosses the 32-bit address boundary"
+    if len(data) > self.PCIE_BULK_CHUNK_SIZE:
+      for off in range(0, len(data), self.PCIE_BULK_CHUNK_SIZE):
+        self.pcie_mem_write(address + off, data[off:off+self.PCIE_BULK_CHUNK_SIZE])
+      return
+    fmt_type = 0x60 if address >> 32 else 0x40
+    if len(data) == 4:
+      self.pcie_request(fmt_type, address, int.from_bytes(data, "little"))
+      return
+    self._f0_out(fmt_type, 0x0F, address, len(data) // 4, mode=1)
+    self.usb.bulk_write(data, timeout=30000)
 
   def pcie_mem_read(self, address:int, nbytes:int) -> memoryview:
     """Streaming PCIe memory read via 0xF0 mode 2 + bulk IN. Returns little-endian bytes."""
     assert nbytes % 4 == 0, f"pcie_mem_read requires 4-byte aligned size, got {nbytes}"
-    self._f0_out(0x20, 0x0F, address, nbytes // 4, mode=2)
+    assert address >= 0 and (address >> 32 or address + nbytes <= (1 << 32)), "PCIe transfer crosses the 32-bit address boundary"
+    if nbytes > self.PCIE_BULK_CHUNK_SIZE:
+      return memoryview(b''.join(bytes(self.pcie_mem_read(address + off, min(self.PCIE_BULK_CHUNK_SIZE, nbytes - off)))
+                                 for off in range(0, nbytes, self.PCIE_BULK_CHUNK_SIZE)))
+    fmt_type = 0x20 if address >> 32 else 0x00
+    if nbytes == 4: return memoryview(struct.pack("<I", self.pcie_request(fmt_type, address)))
+    self._f0_out(fmt_type, 0x0F, address, nbytes // 4, mode=2)
     return self.usb.bulk_read(nbytes, timeout=30000)
 
   def read(self, base_addr:int, length:int) -> bytes:
@@ -160,17 +211,42 @@ class CustomASM24Controller:
     """Write to chip XDATA via vendor control OUT (bRequest=0xE5). wValue=addr, wIndex=val."""
     for off, val in enumerate(data): self.usb.control_write(0xE5, value=base_addr + off, index=val)
 
-  def scsi_write(self, buf:bytes):
-    """Write to SRAM via 0xF2 vendor command + bulk OUT."""
-    buf_padded = buf + b'\x00' * (round_up(len(buf), 512) - len(buf))
-    sectors = len(buf_padded) // 512
-    num_slots = ceildiv(len(buf_padded), 0x4000)  # 16KB per slot
-    windex = (num_slots & 0xFF) << 8
+  def scsi_write_arm(self, size:int, start_slot:int=0):
+    """Arm repeated bulk OUT transfers to an SRAM slot range."""
+    padded_size = round_up(size, 512)
+    sectors, num_slots = padded_size // 512, ceildiv(padded_size, 0x4000)
+    assert 0 < sectors < 0x8000, f"invalid F2 sector count {sectors:#x}"
+    assert 0 <= start_slot < 32 and start_slot + num_slots <= 32, f"SRAM slot range {start_slot}:{start_slot+num_slots} is out of bounds"
+    windex = (start_slot & 0xFF) | ((num_slots & 0xFF) << 8)
     self.usb.control_write(0xF2, value=sectors, index=windex)
+
+  def scsi_write(self, buf:bytes|memoryview, start_slot:int=0):
+    """Write to SRAM via 0xF2 vendor command + bulk OUT."""
+    padded_size = round_up(len(buf), 512)
+    buf_padded = buf if len(buf) == padded_size else bytes(buf) + bytes(padded_size - len(buf))
+    self.scsi_write_arm(len(buf_padded), start_slot)
     self.usb.bulk_write(buf_padded)
 
-  def scsi_read_arm(self, size:int):
-    windex = (ceildiv(size, 0x4000) & 0xFF) << 8
+  @classmethod
+  def gsp_stream_chunks(cls, image:bytes|memoryview):
+    ring_size, batch_size = cls.GSP_RING_PAGES * 0x1000, cls.GSP_STREAM_BATCH_PAGES * 0x1000
+    assert cls.GSP_RING_PAGE % 4 == 0 and cls.GSP_RING_PAGES % cls.GSP_STREAM_BATCH_PAGES == 0
+    for off in range(ring_size, len(image), batch_size):
+      chunk = bytes(image[off:off+batch_size])
+      yield (cls.GSP_STREAM_FIRST_WRITE + (off-ring_size) / ring_size * cls.GSP_STREAM_PERIOD,
+             cls.GSP_RING_PAGE // 4 + (off % ring_size) // 0x4000, chunk.ljust(batch_size, b'\x00'))
+
+  def stream_gsp_image(self, image:bytes|memoryview, launched_at:float):
+    """Keep the SEC2-visible SRAM ring populated while it verifies the GSP image."""
+    for delay, start_slot, payload in self.gsp_stream_chunks(image):
+      deadline = launched_at + delay
+      while time.perf_counter() < deadline: pass
+      self.scsi_write(payload, start_slot=start_slot)
+
+  def scsi_read_arm(self, size:int, start_slot:int=0):
+    num_slots = ceildiv(size, 0x4000)
+    assert 0 <= start_slot < 32 and start_slot + num_slots <= 32, f"SRAM slot range {start_slot}:{start_slot+num_slots} is out of bounds"
+    windex = (start_slot & 0xFF) | ((num_slots & 0xFF) << 8)
     self.usb.control_write(0xF2, value=(ceildiv(size, 512) & 0x7FFF) | 0x8000, index=windex)
 
   def scsi_read(self, size:int) -> memoryview: return self.usb.bulk_read(round_up(size, 512), timeout=10000)[:size]
@@ -180,24 +256,145 @@ class USBMMIOInterface(MMIOInterface):
     self.usb, self.addr, self.nbytes, self.fmt, self.el_sz, self.pcimem = usb, addr, size, fmt, struct.calcsize(fmt), pcimem
 
   def _off_from_index(self, index):
-    if isinstance(index, slice): return ((index.start or 0) * self.el_sz, ((index.stop or len(self))-(index.start or 0)) * self.el_sz)
+    if isinstance(index, slice):
+      start, stop, step = index.indices(len(self))
+      if step != 1: raise IndexError("USB MMIO slices require a unit stride")
+      return (start * self.el_sz, (stop - start) * self.el_sz)
+    if index < 0: index += len(self)
+    if not 0 <= index < len(self): raise IndexError(index)
     return (index * self.el_sz, self.el_sz)
 
   def __getitem__(self, index):
     off, sz = self._off_from_index(index)
     if self.pcimem:
-      assert sz % 4 == 0 and off % 4 == 0, f"pcie_mem_read requires 4-byte aligned access, got off={off}, sz={sz}"
-      data = self.usb.pcie_mem_read(self.addr + off, sz)
+      if sz == 0: data = memoryview(b"")
+      else:
+        start, end = self.addr + off, self.addr + off + sz
+        aligned_start, aligned_end = start & ~0x3, round_up(end, 4)
+        data = self.usb.pcie_mem_read(aligned_start, aligned_end - aligned_start)[start-aligned_start:end-aligned_start]
     else: data = self.usb.scsi_read(sz) if self.addr == 0xf000 else self.usb.read(self.addr + off, sz)
-    return int.from_bytes(data, "little") if sz == self.el_sz else data
+    if isinstance(index, slice): return data if self.fmt == 'B' else memoryview(data).cast(self.fmt).tolist()
+    return int.from_bytes(data, "little")
 
   def __setitem__(self, index, data):
-    off, _ = self._off_from_index(index)
+    off, sz = self._off_from_index(index)
     data = struct.pack(self.fmt, data) if isinstance(data, int) else bytes(data)
+    assert len(data) == sz, f"USB MMIO write size mismatch: {len(data)} != {sz}"
     if not self.pcimem: self.usb.scsi_write(data) if self.addr == 0xf000 else self.usb.write(self.addr + off, data)
-    else: self.usb.pcie_mem_write(self.addr+off, data)
+    elif data:
+      start, end = self.addr + off, self.addr + off + len(data)
+      aligned_start, aligned_end = start & ~0x3, round_up(end, 4)
+      if start == aligned_start and end == aligned_end: aligned = data
+      else:
+        aligned = bytearray(self.usb.pcie_mem_read(aligned_start, aligned_end - aligned_start))
+        aligned[start-aligned_start:end-aligned_start] = data
+      self.usb.pcie_mem_write(aligned_start, aligned)
 
   def view(self, offset:int=0, size:int|None=None, fmt=None):
     return USBMMIOInterface(self.usb, self.addr+offset, self.nbytes-offset if size is None else size, fmt=fmt or self.fmt, pcimem=self.pcimem)
+
+class ASM24GSPQueueInterface(MMIOInterface):
+  PAGE_SIZE, SLOT_SIZE, SRAM_SIZE, PTE_XDATA = 0x1000, 0x4000, 0x80000, 0xA000
+  NVIDIA_PAGE_PADDRS = (0x213000, 0x253000, 0x24F000, 0x250000, 0x251000, 0x252000,
+                        0x828000, 0x820000, 0x200000, 0x820000, 0x200000)
+
+  def __init__(self, usb:CustomASM24Controller, size:int=0x81000, fmt='B', offset:int=0, root:ASM24GSPQueueInterface|None=None,
+               page_paddrs:tuple[int, ...]|None=None):
+    # The logical layout is: PTE page, command queue, status queue. The PTE uses the ASM's dedicated
+    # 0x820000 PCIe window, leaving all 128 contiguous SRAM pages for the two native-size queues.
+    self.usb, self.offset, self.nbytes, self.fmt, self.el_sz = usb, offset, size, fmt, struct.calcsize(fmt)
+    if root is None:
+      assert (size - self.PAGE_SIZE) % (2 * self.PAGE_SIZE) == 0, f"invalid GSP queue allocation size {size:#x}"
+      queue_pages = (size - self.PAGE_SIZE) // (2 * self.PAGE_SIZE)
+      assert 2 * queue_pages <= self.SRAM_SIZE // self.PAGE_SIZE, f"GSP queues do not fit in ASM SRAM: {size:#x}"
+      self._root, self._mirror, self._pte_mirror, self._read_pending = self, bytearray(self.SRAM_SIZE), bytearray(self.PAGE_SIZE), False
+      self._cmd_hdr_page, self._stat_hdr_page = 1, 1 + queue_pages
+      self._phys_pages = page_paddrs or ((0x820000,) + tuple(self._sram_paddr(page) for page in range(2 * queue_pages)))
+      assert len(self._phys_pages) == size // self.PAGE_SIZE, f"GSP page map has {len(self._phys_pages)} pages for allocation {size:#x}"
+      self._mapped_pages, self._direct_status = len(self._phys_pages), self._phys_pages == self.NVIDIA_PAGE_PADDRS
+    else: self._root = root
+
+  @staticmethod
+  def _sram_paddr(page:int) -> int: return 0x200000 + page * 0x1000
+
+  def paddrs(self) -> list[int]: return list(self._root._phys_pages)
+
+  def __len__(self): return self.nbytes // self.el_sz
+
+  def _off_from_index(self, index):
+    if isinstance(index, slice):
+      assert index.step in (None, 1), "strided queue slices are not supported"
+      start, stop = index.start or 0, index.stop if index.stop is not None else len(self)
+      return start * self.el_sz, (stop - start) * self.el_sz
+    return index * self.el_sz, self.el_sz
+
+  def _page_mapping(self, logical_page:int) -> tuple[str, int]:
+    paddr = self._root._phys_pages[logical_page]
+    if logical_page > self._root._stat_hdr_page and paddr == 0x200000: return "xdata", 0xF000
+    if 0x200000 <= paddr < 0x280000: return "sram", paddr - 0x200000
+    return "xdata", {0x820000: 0xA000, 0x828000: 0xB800}[paddr]
+
+  def _pieces(self, offset:int, size:int):
+    end = offset + size
+    while offset < end:
+      page, page_off = divmod(offset, self.PAGE_SIZE)
+      chunk = min(end - offset, self.PAGE_SIZE - page_off)
+      kind, mapped = self._page_mapping(page)
+      yield kind, mapped + page_off, chunk
+      offset += chunk
+
+  def arm_read(self):
+    if self._root._direct_status or hasattr(self._root, "_read_sram"): return
+    # F2 bulk writes replace an earlier bulk-read setup, so rearm after every command is posted.
+    self.usb.scsi_read_arm(self.SRAM_SIZE)
+    self._root._read_pending = True
+
+  def sync(self):
+    if self._root._direct_status or hasattr(self._root, "_read_sram"): return
+    if self._root._read_pending:
+      data = self.usb.scsi_read(self.SRAM_SIZE)
+      assert len(data) == self.SRAM_SIZE, f"short SRAM queue read: {len(data):#x}/{self.SRAM_SIZE:#x}"
+      self._root._mirror[:] = data
+      self._root._read_pending = False
+
+  def __getitem__(self, index):
+    off, size = self._off_from_index(index)
+    assert 0 <= off <= self.nbytes and off + size <= self.nbytes
+    absolute, out = self.offset + off, bytearray()
+    if not hasattr(self._root, "_read_sram") and absolute >= self._root._stat_hdr_page * self.PAGE_SIZE: self.sync()
+    for kind, mapped, chunk in self._pieces(absolute, size):
+      if kind == "xdata": out += self.usb.read(mapped, chunk)
+      elif (read_sram:=getattr(self._root, "_read_sram", None)) is not None: out += read_sram(mapped, chunk)
+      else: out += self._root._mirror[mapped:mapped+chunk]
+    if isinstance(index, slice): return bytes(out) if self.fmt == 'B' else memoryview(out).cast(self.fmt).tolist()
+    return int.from_bytes(out, "little")
+
+  def __setitem__(self, index, data):
+    off, size = self._off_from_index(index)
+    assert 0 <= off <= self.nbytes and off + size <= self.nbytes
+    raw = struct.pack(self.fmt, data) if isinstance(data, int) else bytes(data)
+    assert len(raw) == size, f"queue write size mismatch: {len(raw)} != {size}"
+
+    dirty_slots:set[int] = set()
+    pos = 0
+    for kind, mapped, chunk in self._pieces(self.offset + off, size):
+      if kind == "xdata":
+        if self.PTE_XDATA <= mapped < self.PTE_XDATA + self.PAGE_SIZE:
+          self._root._pte_mirror[mapped-self.PTE_XDATA:mapped-self.PTE_XDATA+chunk] = raw[pos:pos+chunk]
+        self.usb.write(mapped, raw[pos:pos+chunk])
+      else:
+        self._root._mirror[mapped:mapped+chunk] = raw[pos:pos+chunk]
+        dirty_slots.update(range(mapped // self.SLOT_SIZE, ceildiv(mapped + chunk, self.SLOT_SIZE)))
+      pos += chunk
+
+    slots = sorted(dirty_slots)
+    while slots:
+      start = end = slots.pop(0)
+      while slots and slots[0] == end + 1: end = slots.pop(0)
+      self.usb.scsi_write(bytes(self._root._mirror[start*self.SLOT_SIZE:(end+1)*self.SLOT_SIZE]), start_slot=start)
+
+  def view(self, offset:int=0, size:int|None=None, fmt=None):
+    assert 0 <= offset <= self.nbytes and (size is None or offset + size <= self.nbytes)
+    return ASM24GSPQueueInterface(self.usb, self.nbytes-offset if size is None else size, fmt or self.fmt, self.offset+offset, self._root)
 
 if DEV.interface.startswith("MOCK"): from test.mockgpu.usb import MockUSB3 as USB3  # type: ignore  # noqa: F811
