@@ -8,6 +8,31 @@ from tinygrad.runtime.support.usb import CustomASM24Controller
 
 
 class TestNVGSPSRAMBoot(unittest.TestCase):
+  def test_sram_boot_does_not_stage_duplicate_vram_sources(self):
+    gsp = object.__new__(NV_GSP)
+    vram_size = 24 << 30
+    gsp.nvdev = types.SimpleNamespace(
+      chip_name="GA102", fw_name="ga102", vram_size=vram_size, fmc_boot=False,
+      flcn=types.SimpleNamespace(frts_offset=vram_size - (2 << 20)),
+      pci_dev=types.SimpleNamespace(gsp_sram_boot=True), _alloc_boot_mem=MagicMock())
+    sections = [types.SimpleNamespace(name=".fwimage", content=b"I" * 0x2000),
+                types.SimpleNamespace(name=".fwsignature_ga10x", content=b"S" * 0x1000)]
+    fw_header = types.SimpleNamespace(data_offset=4, data_size=4, header_offset=0)
+    booter_desc = types.SimpleNamespace(monitorCodeOffset=1, monitorDataOffset=2, manifestOffset=3)
+
+    with patch("tinygrad.runtime.support.nv.ip.fetch_fw", side_effect=[b"elf", bytes(4) + b"BOOT"]), \
+         patch("tinygrad.runtime.support.nv.ip.elf_loader", return_value=(None, sections, None)), \
+         patch("tinygrad.runtime.support.nv.ip.nv.struct_nvfw_bin_hdr") as header_t, \
+         patch("tinygrad.runtime.support.nv.ip.nv.RM_RISCV_UCODE_DESC") as desc_t:
+      header_t.from_buffer_copy.return_value, desc_t.from_buffer_copy.return_value = fw_header, booter_desc
+      gsp.init_wpr_meta()
+
+    gsp.nvdev._alloc_boot_mem.assert_not_called()
+    self.assertEqual(gsp.wpr_meta_sysmem, 0x200000)
+    meta = nv.GspFwWprMeta.from_buffer_copy(gsp._boot_sram)
+    self.assertEqual((meta.sysmemAddrOfSignature, meta.sysmemAddrOfBootloader, meta.sysmemAddrOfRadix3Elf),
+                     (0x201000, 0x202000, 0x208000))
+
   def test_sram_wpr_uses_cyclic_84_page_image_ring(self):
     gsp = object.__new__(NV_GSP)
     gsp.gsp_image = b''.join(bytes((page,)) * 0x1000 for page in range(86))
@@ -42,7 +67,7 @@ class TestNVGSPSRAMBoot(unittest.TestCase):
     dev = object.__new__(USBPCIDevice)
     dev.usb, dev._wait_until = MagicMock(), MagicMock()
     dev.gsp_queues = types.SimpleNamespace(_root=types.SimpleNamespace(_mirror=bytearray(b'queue')))
-    dev._gsp_rm_args_page, dev._gsp_libos_args_page = b'rm', b'libos'
+    dev._gsp_args = {0x100:b'rm', 0x200:b'libos'}
 
     dev.stream_gsp_boot(b'image', 4.0)
 

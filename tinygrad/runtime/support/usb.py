@@ -243,10 +243,8 @@ class CustomASM24Controller:
       while time.perf_counter() < deadline: pass
       self.scsi_write(payload, start_slot=start_slot)
 
-  def scsi_read_arm(self, size:int, start_slot:int=0):
-    num_slots = ceildiv(size, 0x4000)
-    assert 0 <= start_slot < 32 and start_slot + num_slots <= 32, f"SRAM slot range {start_slot}:{start_slot+num_slots} is out of bounds"
-    windex = (start_slot & 0xFF) | ((num_slots & 0xFF) << 8)
+  def scsi_read_arm(self, size:int):
+    windex = (ceildiv(size, 0x4000) & 0xFF) << 8
     self.usb.control_write(0xF2, value=(ceildiv(size, 512) & 0x7FFF) | 0x8000, index=windex)
 
   def scsi_read(self, size:int) -> memoryview: return self.usb.bulk_read(round_up(size, 512), timeout=10000)[:size]
@@ -294,30 +292,17 @@ class USBMMIOInterface(MMIOInterface):
     return USBMMIOInterface(self.usb, self.addr+offset, self.nbytes-offset if size is None else size, fmt=fmt or self.fmt, pcimem=self.pcimem)
 
 class ASM24GSPQueueInterface(MMIOInterface):
-  PAGE_SIZE, SLOT_SIZE, SRAM_SIZE, PTE_XDATA = 0x1000, 0x4000, 0x80000, 0xA000
-  NVIDIA_PAGE_PADDRS = (0x213000, 0x253000, 0x24F000, 0x250000, 0x251000, 0x252000,
-                        0x828000, 0x820000, 0x200000, 0x820000, 0x200000)
+  PAGE_SIZE, SLOT_SIZE, SRAM_SIZE = 0x1000, 0x4000, 0x80000
+  PAGE_PADDRS = (0x213000, 0x253000, 0x24F000, 0x250000, 0x251000, 0x252000, 0x828000, 0x820000, 0x200000, 0x820000, 0x200000)
 
-  def __init__(self, usb:CustomASM24Controller, size:int=0x81000, fmt='B', offset:int=0, root:ASM24GSPQueueInterface|None=None,
-               page_paddrs:tuple[int, ...]|None=None):
-    # The logical layout is: PTE page, command queue, status queue. The PTE uses the ASM's dedicated
-    # 0x820000 PCIe window, leaving all 128 contiguous SRAM pages for the two native-size queues.
+  def __init__(self, usb:CustomASM24Controller, size:int=0xB000, fmt='B', offset:int=0, root:ASM24GSPQueueInterface|None=None):
     self.usb, self.offset, self.nbytes, self.fmt, self.el_sz = usb, offset, size, fmt, struct.calcsize(fmt)
     if root is None:
-      assert (size - self.PAGE_SIZE) % (2 * self.PAGE_SIZE) == 0, f"invalid GSP queue allocation size {size:#x}"
-      queue_pages = (size - self.PAGE_SIZE) // (2 * self.PAGE_SIZE)
-      assert 2 * queue_pages <= self.SRAM_SIZE // self.PAGE_SIZE, f"GSP queues do not fit in ASM SRAM: {size:#x}"
-      self._root, self._mirror, self._pte_mirror, self._read_pending = self, bytearray(self.SRAM_SIZE), bytearray(self.PAGE_SIZE), False
-      self._cmd_hdr_page, self._stat_hdr_page = 1, 1 + queue_pages
-      self._phys_pages = page_paddrs or ((0x820000,) + tuple(self._sram_paddr(page) for page in range(2 * queue_pages)))
-      assert len(self._phys_pages) == size // self.PAGE_SIZE, f"GSP page map has {len(self._phys_pages)} pages for allocation {size:#x}"
-      self._mapped_pages, self._direct_status = len(self._phys_pages), self._phys_pages == self.NVIDIA_PAGE_PADDRS
+      assert size == len(self.PAGE_PADDRS) * self.PAGE_SIZE, f"invalid NVIDIA GSP queue allocation size {size:#x}"
+      self._root, self._mirror, self._direct_status = self, bytearray(self.SRAM_SIZE), True
     else: self._root = root
 
-  @staticmethod
-  def _sram_paddr(page:int) -> int: return 0x200000 + page * 0x1000
-
-  def paddrs(self) -> list[int]: return list(self._root._phys_pages)
+  def paddrs(self) -> list[int]: return list(self.PAGE_PADDRS)
 
   def __len__(self): return self.nbytes // self.el_sz
 
@@ -329,8 +314,8 @@ class ASM24GSPQueueInterface(MMIOInterface):
     return index * self.el_sz, self.el_sz
 
   def _page_mapping(self, logical_page:int) -> tuple[str, int]:
-    paddr = self._root._phys_pages[logical_page]
-    if logical_page > self._root._stat_hdr_page and paddr == 0x200000: return "xdata", 0xF000
+    paddr = self.PAGE_PADDRS[logical_page]
+    if logical_page > 6 and paddr == 0x200000: return "xdata", 0xF000
     if 0x200000 <= paddr < 0x280000: return "sram", paddr - 0x200000
     return "xdata", {0x820000: 0xA000, 0x828000: 0xB800}[paddr]
 
@@ -343,28 +328,12 @@ class ASM24GSPQueueInterface(MMIOInterface):
       yield kind, mapped + page_off, chunk
       offset += chunk
 
-  def arm_read(self):
-    if self._root._direct_status or hasattr(self._root, "_read_sram"): return
-    # F2 bulk writes replace an earlier bulk-read setup, so rearm after every command is posted.
-    self.usb.scsi_read_arm(self.SRAM_SIZE)
-    self._root._read_pending = True
-
-  def sync(self):
-    if self._root._direct_status or hasattr(self._root, "_read_sram"): return
-    if self._root._read_pending:
-      data = self.usb.scsi_read(self.SRAM_SIZE)
-      assert len(data) == self.SRAM_SIZE, f"short SRAM queue read: {len(data):#x}/{self.SRAM_SIZE:#x}"
-      self._root._mirror[:] = data
-      self._root._read_pending = False
-
   def __getitem__(self, index):
     off, size = self._off_from_index(index)
     assert 0 <= off <= self.nbytes and off + size <= self.nbytes
     absolute, out = self.offset + off, bytearray()
-    if not hasattr(self._root, "_read_sram") and absolute >= self._root._stat_hdr_page * self.PAGE_SIZE: self.sync()
     for kind, mapped, chunk in self._pieces(absolute, size):
       if kind == "xdata": out += self.usb.read(mapped, chunk)
-      elif (read_sram:=getattr(self._root, "_read_sram", None)) is not None: out += read_sram(mapped, chunk)
       else: out += self._root._mirror[mapped:mapped+chunk]
     if isinstance(index, slice): return bytes(out) if self.fmt == 'B' else memoryview(out).cast(self.fmt).tolist()
     return int.from_bytes(out, "little")
@@ -378,10 +347,7 @@ class ASM24GSPQueueInterface(MMIOInterface):
     dirty_slots:set[int] = set()
     pos = 0
     for kind, mapped, chunk in self._pieces(self.offset + off, size):
-      if kind == "xdata":
-        if self.PTE_XDATA <= mapped < self.PTE_XDATA + self.PAGE_SIZE:
-          self._root._pte_mirror[mapped-self.PTE_XDATA:mapped-self.PTE_XDATA+chunk] = raw[pos:pos+chunk]
-        self.usb.write(mapped, raw[pos:pos+chunk])
+      if kind == "xdata": self.usb.write(mapped, raw[pos:pos+chunk])
       else:
         self._root._mirror[mapped:mapped+chunk] = raw[pos:pos+chunk]
         dirty_slots.update(range(mapped // self.SLOT_SIZE, ceildiv(mapped + chunk, self.SLOT_SIZE)))

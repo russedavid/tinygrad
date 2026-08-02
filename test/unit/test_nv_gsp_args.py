@@ -31,14 +31,15 @@ class TestNVGSPArguments(unittest.TestCase):
   def test_vram_logs_are_described_as_framebuffer_memory(self):
     gsp = object.__new__(NV_GSP)
     stage = MagicMock(return_value=0x828200)
-    pci_dev = types.SimpleNamespace(boot_mem_in_vram=True, stage_gsp_libos_args=stage)
+    pci_dev = types.SimpleNamespace(boot_mem_in_vram=True, stage_gsp_args=stage)
     gsp.nvdev = types.SimpleNamespace(pci_dev=pci_dev, _alloc_boot_mem=MagicMock(return_value=(MagicMock(), 0x300000, [0x300000])))
     gsp.rm_args_sysmem = 0x828100
 
     gsp.init_libos_args()
 
     self.assertEqual(gsp.libos_args_sysmem, 0x828200)
-    args = stage.call_args.args[0]
+    args, offset = stage.call_args.args
+    self.assertEqual(offset, 0x200)
     struct_size = ctypes.sizeof(nv.LibosMemoryRegionInitArgument)
     regions = [nv.LibosMemoryRegionInitArgument.from_buffer_copy(args, i * struct_size) for i in range(6)]
     self.assertTrue(all(region.loc == nv.LIBOS_MEMORY_REGION_LOC_FB for region in regions[:5]))

@@ -30,16 +30,6 @@ class NVSignal(HCQSignal):
     # Reasonable to sleep for long workloads (which take more than 200ms) and only timeline signals.
     if time_spent_since_last_sleep_ms > 200 and self.owner is not None: self.owner.iface.sleep(200)
 
-  def wait(self, value:int, timeout:int|None=None):
-    try: return super().wait(value, timeout)
-    except RuntimeError as exc:
-      diagnostics = getattr(self.owner.iface, "gpfifo_diagnostics", None) if self.owner is not None else None
-      if diagnostics is not None:
-        try: detail = diagnostics()
-        except Exception: pass
-        else: raise RuntimeError(f"{exc}; {detail}") from exc
-      raise
-
 def get_error_str(status): return f"{status}: {nv_gpu.nv_status_codes.get(status, 'Unknown error')}"
 
 NV_PFAULT_FAULT_TYPE = {dt:name for name,dt in nv_gpu.__dict__.items() if name.startswith("NV_PFAULT_FAULT_TYPE_")}
@@ -388,11 +378,7 @@ class GPFifo:
   gpput: MMIOInterface
   entries_count: int
   token: int
-  gpget: MMIOInterface|None = None
   put_value: int = 0
-  channel: int|None = None
-  ring_paddr: int|None = None
-  userd_paddr: int|None = None
 
 class NVKIface:
   root = None
@@ -612,7 +598,6 @@ class PCIIface(PCIIfaceBase):
     if self.dev_impl.is_err_state: raise RuntimeError("Device fault detected")
 
 class USBIface(PCIIface):
-  _ENGINE_INFO_RUNLIST, _ENGINE_INFO_RUNLIST_PRI_BASE, _ENGINE_INFO_CHRAM_PRI_BASE = 3, 11, 14
   # The fixed 256 MiB BAR1 also contains boot and kernel-argument allocations; triple buffering fits the remaining aperture.
   copy_batch_cnt = 3
 
@@ -637,39 +622,11 @@ class USBIface(PCIIface):
     invalid = (nv_gpu.NV2080_CTRL_GPU_GET_ENGINE_RUNLIST_PRI_BASE_NULL, nv_gpu.NV2080_CTRL_GPU_GET_ENGINE_RUNLIST_PRI_BASE_ERROR)
     if self.runlist_pri_base in invalid:
       raise RuntimeError(f"Unable to resolve graphics runlist doorbell: base={self.runlist_pri_base:#x}, runlist={self.runlist_id:#x}")
-    usermode = self.pci_dev.map_bar(bar=0, fmt='I', off=self.runlist_pri_base, size=0x1000)
-
-    # CHRAM exposes whether HOST saw a doorbell and where a channel stopped. It is optional diagnostic state.
-    self.chram_mmio:MMIOInterface|None = None
-    base_index = 0
-    while True:
-      table = self.rm_control(self.dev.subdevice, nv_gpu.NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE,
-        nv_gpu.NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS(baseIndex=base_index))
-      entry = next((entry for entry in table.entries[:table.numEntries]
-                    if entry.engineData[self._ENGINE_INFO_RUNLIST] == self.runlist_id and
-                       entry.engineData[self._ENGINE_INFO_RUNLIST_PRI_BASE] == self.runlist_pri_base), None)
-      if entry is not None:
-        self.chram_pri_base = int(entry.engineData[self._ENGINE_INFO_CHRAM_PRI_BASE])
-        self.chram_mmio = self.pci_dev.map_bar(bar=0, fmt='I', off=self.chram_pri_base, size=0x2000)
-        break
-      if not table.bMore or table.numEntries == 0: break
-      base_index += table.numEntries
-    return 0xce000000, usermode
+    return 0xce000000, self.pci_dev.map_bar(bar=0, fmt='I', off=self.runlist_pri_base, size=0x1000)
 
   def gpfifo_submit_token(self, token:int) -> int:
     # NV_RUNLIST_INTERNAL_DOORBELL_CHID_HW is bits 10:0; virtual doorbells consume the complete RM token.
     return token & 0x7ff if getattr(self, "_runlist_doorbell", False) else token
-
-  def gpfifo_health(self) -> tuple[dict[str, int|None], list[tuple[int, int, int]]]:
-    channels:dict[str, int|None] = {}
-    for name in ("compute", "dma"):
-      if (fifo:=getattr(self.dev, f"{name}_gpfifo", None)) is None: continue
-      chid = self.gpfifo_submit_token(fifo.token) & 0x7ff
-      chram_mmio = getattr(self, "chram_mmio", None)
-      channels[name] = chram_mmio[chid] if chram_mmio is not None else None
-    aer = [(bus, self.pci_dev.usb.pcie_cfg_req(0x104, bus=bus, size=4), self.pci_dev.usb.pcie_cfg_req(0x110, bus=bus, size=4))
-           for bus in range(self.pci_dev.gpu_bus + 1)]
-    return channels, aer
 
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, **kwargs) -> HCQBuffer:
     # USB has no host-memory aperture, so keep host buffers in VRAM and expose them through BAR1.
@@ -683,25 +640,6 @@ class USBIface(PCIIface):
     # USBMMIOInterface is a transport object, not a process mapping at ret.va_addr.
     ret.meta.has_cpu_mapping = False
     return ret
-
-  def gpfifo_diagnostics(self) -> str:
-    channel_health, aer = self.gpfifo_health()
-    states = []
-    for name in ("compute", "dma"):
-      if (fifo:=getattr(self.dev, f"{name}_gpfifo", None)) is None: continue
-      index = (fifo.put_value - 1) % fifo.entries_count
-      chram = channel_health[name]
-      chram_state = "unavailable" if chram is None else \
-        f"{chram:#x}[enable={(chram >> 1) & 1}, next={(chram >> 2) & 1}, busy={(chram >> 3) & 1}, " \
-        f"pbdma_faulted={(chram >> 4) & 1}, eng_faulted={(chram >> 5) & 1}, on_pbdma={(chram >> 6) & 1}, " \
-        f"on_eng={(chram >> 7) & 1}, pending={(chram >> 8) & 1}, acquire_fail={(chram >> 12) & 1}]"
-      states.append(f"{name}(channel={fifo.channel if fifo.channel is not None else -1:#x}, token={fifo.token:#x}, "
-                    f"doorbell_token={self.gpfifo_submit_token(fifo.token):#x}, "
-                    f"ring_paddr={fifo.ring_paddr if fifo.ring_paddr is not None else -1:#x}, "
-                    f"userd_paddr={fifo.userd_paddr if fifo.userd_paddr is not None else -1:#x}, "
-                    f"host_put={fifo.put_value:#x}, GPPut={fifo.gpput[0]:#x}, "
-                    f"GPGet={fifo.gpget[0] if fifo.gpget is not None else -1:#x}, ring[{index:#x}]={fifo.ring[index]:#x}, CHRAM={chram_state})")
-    return f"USB GPFIFO state: {', '.join(states)}; AER={[(bus, hex(unc), hex(cor)) for bus, unc, cor in aer]}"
 
 class MOCKIface(NVKIface): count = 1
 
@@ -785,13 +723,8 @@ class NVDevice(HCQCompiled[NVSignal]):
       nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS(workSubmitToken=-1))
     if ctxshare != 0: self.iface.setup_gpfifo_vm(gpfifo)
 
-    userd = gpfifo_area.cpu_view().view(offset + entries*8)
-    mapping = getattr(gpfifo_area.meta, "mapping", None)
-    ring_paddr = mapping.paddrs[0][0] + offset if mapping is not None else None
     return GPFifo(ring=gpfifo_area.cpu_view().view(offset, entries*8, fmt='Q'), entries_count=entries, token=ws_token_params.workSubmitToken,
-                  gpget=userd.view(getattr(nv_gpu.AmpereAControlGPFifo, 'GPGet').offset, 4, fmt='I'),
-                  gpput=userd.view(getattr(nv_gpu.AmpereAControlGPFifo, 'GPPut').offset, 4, fmt='I'), channel=gpfifo,
-                  ring_paddr=ring_paddr, userd_paddr=ring_paddr + entries*8 if ring_paddr is not None else None)
+                  gpput=gpfifo_area.cpu_view().view(offset + entries*8 + getattr(nv_gpu.AmpereAControlGPFifo, 'GPPut').offset, fmt='I'))
 
   def _query_gpu_info(self, *reqs):
     nvrs = [getattr(nv_gpu,'NV2080_CTRL_GR_INFO_INDEX_'+r.upper(), getattr(nv_gpu,'NV2080_CTRL_GR_INFO_INDEX_LITTER_'+r.upper(), None)) for r in reqs]

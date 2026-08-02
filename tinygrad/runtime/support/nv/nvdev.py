@@ -3,7 +3,7 @@ import time, functools, tinygrad.runtime.autogen.nv_regs
 from tinygrad.helpers import getenv, DEBUG, getbits, round_up
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
-from tinygrad.runtime.support.nv.ip import NV_FLCN, NV_FLCN_COT, NV_GSP, find_vbios_rom_offset
+from tinygrad.runtime.support.nv.ip import NV_FLCN, NV_FLCN_COT, NV_GSP
 from tinygrad.runtime.support.system import PCIDevice
 from tinygrad.runtime.support.hcq import MMIOInterface
 
@@ -73,8 +73,6 @@ class NVMemoryManager(MemoryManager):
   def on_range_mapped(self): self.dev.NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE.write((1 << 0) | (1 << 1) | (1 << 6) | (1 << 31))
 
 class NVDev:
-  _VBIOS_BASE = 0x00300000
-
   def __init__(self, pci_dev:PCIDevice):
     self.pci_dev, self.devfmt, self.mmio = pci_dev, pci_dev.pcibus, pci_dev.map_bar(0, fmt='I')
 
@@ -97,25 +95,6 @@ class NVDev:
     if NV_DEBUG >= 4: print(f"wreg: {hex(addr)} = {hex(value)}")
   def rreg(self, addr:int) -> int: return self.mmio[addr // 4]
 
-  def _usb_vbios_available(self) -> bool:
-    try: find_vbios_rom_offset(lambda off: self.mmio[(self._VBIOS_BASE + off) // 4])
-    except ValueError: return False
-    return True
-
-  def _reset_stale_state(self):
-    wpr2_up = self.reg("NV_PFB_PRI_MMU_WPR2_ADDR_HI").read() != 0
-    usb_vbios_missing = getattr(self.pci_dev, "boot_mem_in_vram", False) and not self._usb_vbios_available()
-    if not wpr2_up and not usb_vbios_missing: return
-
-    self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
-    if DEBUG >= 2:
-      reasons = ", ".join(reason for condition, reason in ((wpr2_up, "WPR2 is up"), (usb_vbios_missing, "VBIOS is unavailable")) if condition)
-      print(f"nv {self.devfmt}: {reasons}. Issuing a full reset.", flush=True)
-    self.pci_dev.reset()
-    time.sleep(0.1) # wait until device can respond again
-    if usb_vbios_missing and not self._usb_vbios_available():
-      raise RuntimeError("NVIDIA USB reset completed but VBIOS is still unavailable; physically power-cycle the GPU and UT3G")
-
   def _early_ip_init(self):
     self.reg_names:set[str] = set()
     self.reg_offsets:dict[str, tuple[int, int]] = {}
@@ -124,7 +103,11 @@ class NVDev:
     self.include("dev_fb", "tu102")
     self.include("dev_gc6_island", "ga102")
 
-    self._reset_stale_state()
+    if self.reg("NV_PFB_PRI_MMU_WPR2_ADDR_HI").read() != 0:
+      self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
+      if DEBUG >= 2: print(f"nv {self.devfmt}: WPR2 is up. Issuing a full reset.", flush=True)
+      self.pci_dev.reset()
+      time.sleep(0.1) # wait until device can respond again
 
     self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
     self.chip_id = self.reg("NV_PMC_BOOT_0").read()

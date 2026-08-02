@@ -239,13 +239,11 @@ class PCIDevice:
 class USBPCIDevice(PCIDevice):
   def __init__(self, devpref:str, dev, pcibus):
     self.devpref, self.pcibus, self.peer_group = devpref, pcibus, f"USBPCIDevice_{pcibus}"
-    self.boot_mem_in_vram = devpref == "NV"
-    self.gsp_queue_size = 0x5000 if devpref == "NV" else None
+    is_nv = devpref == "NV"
+    self.boot_mem_in_vram = self.skip_gsp_registry = self.gsp_sram_boot = self.verify_bar_writes = is_nv
+    self.gsp_queue_size = 0x5000 if is_nv else None
     # Initial GA102 boot drains hundreds of fixed-window NOCAT records before CPU-sequencer/INIT_DONE.
-    self.gsp_rpc_timeout_ms = 120000 if devpref == "NV" else None
-    self.skip_gsp_registry = devpref == "NV"
-    self.gsp_sram_boot = devpref == "NV"
-    self.verify_bar_writes = devpref == "NV"
+    self.gsp_rpc_timeout_ms = 120000 if is_nv else None
     self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
     usb = USB3(dev)
     if DEBUG >= 1: print(f"{devpref.lower()} {self.pcibus}: product string: {usb.product!r}")
@@ -267,21 +265,16 @@ class USBPCIDevice(PCIDevice):
     return self.dma_view(0xf000 + (off:=self.sram.alloc(size)), size), [0x200000 + off]
 
   def alloc_gsp_queues(self, size:int) -> tuple[MMIOInterface, list[int]]:
-    page_paddrs = ASM24GSPQueueInterface.NVIDIA_PAGE_PADDRS if self.devpref == "NV" else None
-    self.gsp_queues = ASM24GSPQueueInterface(self.usb, size, page_paddrs=page_paddrs)
+    self.gsp_queues = ASM24GSPQueueInterface(self.usb, size)
     return self.gsp_queues, self.gsp_queues.paddrs()
 
-  def stage_gsp_rm_args(self, data:bytes) -> int:
+  def stage_gsp_args(self, data:bytes, offset:int) -> int:
     assert len(data) <= 0x100
-    self._gsp_rm_args_page = data + bytes(0x100 - len(data))
-    self.usb.write(0xB900, self._gsp_rm_args_page)
-    return 0x828100
-
-  def stage_gsp_libos_args(self, data:bytes) -> int:
-    assert len(data) <= 0x100
-    self._gsp_libos_args_page = data + bytes(0x100 - len(data))
-    self.usb.write(0xBA00, self._gsp_libos_args_page)
-    return 0x828200
+    page = data + bytes(0x100 - len(data))
+    self._gsp_args = getattr(self, "_gsp_args", {})
+    self._gsp_args[offset] = page
+    self.usb.write(0xB800 + offset, page)
+    return 0x828000 + offset
 
   def stage_gsp_boot(self, data:bytes):
     # The UT3G stream is only reliable at Gen1 with small read requests and ASPM disabled.
@@ -296,9 +289,6 @@ class USBPCIDevice(PCIDevice):
     time.sleep(0.1)
     devctl = self.usb.pcie_cfg_req(0x78 + 0x08, bus=endpoint_bus, size=2)
     self.usb.pcie_cfg_req(0x78 + 0x08, bus=endpoint_bus, value=devctl & ~0x7000, size=2)
-    for bus in range(endpoint_bus + 1):
-      self.usb.pcie_cfg_req(0x104, bus=bus, value=0xFFFFFFFF, size=4)
-      self.usb.pcie_cfg_req(0x110, bus=bus, value=0xFFFFFFFF, size=4)
     self.usb.scsi_write(data)
 
   @staticmethod
@@ -313,11 +303,7 @@ class USBPCIDevice(PCIDevice):
     self.usb.scsi_write(bytes(self.gsp_queues._root._mirror))
     self._wait_until(launched_at + 0.380)
     self.usb.scsi_write(bytes(self.gsp_queues._root._mirror))
-    self.usb.write(0xB900, self._gsp_rm_args_page)
-    self.usb.write(0xBA00, self._gsp_libos_args_page)
-
-  def arm_gsp_queue_read(self): self.gsp_queues.arm_read()
-  def sync_gsp_queue(self): self.gsp_queues.sync()
+    for offset, page in self._gsp_args.items(): self.usb.write(0xB800 + offset, page)
 
   def read_config(self, offset:int, size:int): return self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, size=size)
   def write_config(self, offset:int, value:int, size:int): self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, value=value, size=size)

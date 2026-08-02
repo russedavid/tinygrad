@@ -2,7 +2,7 @@ import ctypes, unittest
 import numpy as np
 
 from tinygrad import Device, Tensor
-from tinygrad.runtime.autogen import libusb, pci
+from tinygrad.runtime.autogen import libusb, pci, nv_570 as nv_gpu
 from tinygrad.runtime.ops_nv import USBIface
 from tinygrad.runtime.support.usb import CustomASM24Controller, USB3
 
@@ -41,13 +41,22 @@ class TestNVUSB3(unittest.TestCase):
 
   def test_channel_and_aer_health(self):
     self.dev.synchronize()
-    channels, aer = self.iface.gpfifo_health()
-    self.assertEqual(set(channels), {"compute", "dma"})
-    for name, state in channels.items():
-      self.assertIsInstance(state, int, f"{name} CHRAM diagnostics unavailable")
+    base_index, chram = 0, None
+    while chram is None:
+      table = self.iface.rm_control(self.dev.subdevice, nv_gpu.NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE,
+        nv_gpu.NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS(baseIndex=base_index))
+      entry = next((x for x in table.entries[:table.numEntries]
+                    if x.engineData[3] == self.iface.runlist_id and x.engineData[11] == self.iface.runlist_pri_base), None)
+      if entry is not None: chram = self.iface.pci_dev.map_bar(0, fmt='I', off=int(entry.engineData[14]), size=0x2000)
+      elif not table.bMore or not table.numEntries: self.fail("graphics CHRAM table entry unavailable")
+      else: base_index += table.numEntries
+    for name in ("compute", "dma"):
+      fifo = getattr(self.dev, f"{name}_gpfifo")
+      state = chram[self.iface.gpfifo_submit_token(fifo.token) & 0x7ff]
       self.assertEqual(state & CHRAM_FAULT_BITS, 0, f"{name} CHRAM fault bits set: {state:#x}")
-    self.assertTrue(aer)
-    for bus, uncorrectable, correctable in aer:
+    for bus in range(self.iface.pci_dev.gpu_bus + 1):
+      uncorrectable = self.iface.pci_dev.usb.pcie_cfg_req(0x104, bus=bus, size=4)
+      correctable = self.iface.pci_dev.usb.pcie_cfg_req(0x110, bus=bus, size=4)
       self.assertEqual((uncorrectable, correctable), (0, 0), f"PCIe AER fault on bus {bus}")
 
 

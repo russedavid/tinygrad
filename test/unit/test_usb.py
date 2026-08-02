@@ -199,8 +199,8 @@ class TestUSBPCIeDiscovery(unittest.TestCase):
     dev = object.__new__(USBPCIDevice)
     dev.usb = MagicMock()
 
-    self.assertEqual(dev.stage_gsp_rm_args(b"RM"), 0x828100)
-    self.assertEqual(dev.stage_gsp_libos_args(b"OS"), 0x828200)
+    self.assertEqual(dev.stage_gsp_args(b"RM", 0x100), 0x828100)
+    self.assertEqual(dev.stage_gsp_args(b"OS", 0x200), 0x828200)
 
     self.assertEqual(dev.usb.write.call_args_list[0].args, (0xB900, b"RM" + bytes(0xFE)))
     self.assertEqual(dev.usb.write.call_args_list[1].args, (0xBA00, b"OS" + bytes(0xFE)))
@@ -226,7 +226,7 @@ class TestUSBPCIeDiscovery(unittest.TestCase):
     self.assertIn((0x80 + 0x30, 1, 1), writes)
     self.assertIn((0x78 + 0x30, 2, 1), writes)
     self.assertIn((0x78 + 0x08, 2, 0), writes)
-    self.assertIn((0x104, 2, 0xFFFFFFFF), writes)
+    self.assertFalse(any(offset in (0x104, 0x110) for offset, _, _ in writes))
     dev.usb.scsi_write.assert_called_once_with(b"boot")
 
   @patch("tinygrad.runtime.support.system.time.sleep")
@@ -300,16 +300,13 @@ class TestUSBIfaceAllocation(unittest.TestCase):
 
 class FakeQueueController:
   def __init__(self):
-    self.xdata, self.writes, self.read_arms = {}, [], []
-    self.read_data = bytes(ASM24GSPQueueInterface.SRAM_SIZE)
+    self.xdata, self.writes = {}, []
 
   def read(self, addr, size): return bytes(self.xdata.get(addr+i, 0) for i in range(size))
   def write(self, addr, data):
     self.xdata.update((addr+i, x) for i, x in enumerate(data))
     self.writes.append(("xdata", addr, bytes(data)))
   def scsi_write(self, data, start_slot=0): self.writes.append(("sram", start_slot, bytes(data)))
-  def scsi_read_arm(self, size, start_slot=0): self.read_arms.append((size, start_slot))
-  def scsi_read(self, size): return memoryview(self.read_data[:size])
 
 
 class TestASM24GSPQueueInterface(unittest.TestCase):
@@ -317,43 +314,9 @@ class TestASM24GSPQueueInterface(unittest.TestCase):
     self.controller = FakeQueueController()
     self.queue = ASM24GSPQueueInterface(self.controller)
 
-  def test_page_addresses_include_queue_headers_and_contiguous_sram(self):
-    paddrs = self.queue.paddrs()
-    self.assertEqual(len(paddrs), 129)
-    self.assertEqual(paddrs[:6], [0x820000, 0x200000, 0x201000, 0x202000, 0x203000, 0x204000])
-    self.assertEqual(paddrs[65:68], [0x240000, 0x241000, 0x242000])
-    self.assertEqual(paddrs[-1], 0x27F000)
-
-  def test_writes_route_headers_and_flush_complete_sram_slots(self):
-    self.queue[:8] = b"PTE DATA"
-    self.queue.view(0x1000)[:4] = b"CMDH"
-    self.queue.view(0x2000)[:4] = b"CMDD"
-    self.queue.view(0x41000)[:4] = b"STAH"
-
-    self.assertEqual(self.controller.writes[0], ("xdata", 0xA000, b"PTE DATA"))
-    self.assertEqual(self.controller.writes[1][0:2], ("sram", 0))
-    self.assertEqual(self.controller.writes[1][2][:4], b"CMDH")
-    self.assertEqual(self.controller.writes[2][0:2], ("sram", 0))
-    self.assertEqual(self.controller.writes[2][2][0x1000:0x1004], b"CMDD")
-    self.assertEqual(self.controller.writes[3][0:2], ("sram", 16))
-    self.assertEqual(self.controller.writes[3][2][:4], b"STAH")
-
-    self.queue.view(0x80000)[:4] = b"LAST"
-    self.assertEqual(self.controller.writes[4][0:2], ("sram", 31))
-    self.assertEqual(self.controller.writes[4][2][0x3000:0x3004], b"LAST")
-
-  def test_status_read_uses_armed_bulk_snapshot(self):
-    data = bytearray(ASM24GSPQueueInterface.SRAM_SIZE)
-    data[0x41000:0x41004] = b"RESP"
-    self.controller.read_data = bytes(data)
-
-    self.queue.arm_read()
-    self.assertEqual(self.queue.view(0x42000)[:4], b"RESP")
-    self.assertEqual(self.controller.read_arms, [(0x80000, 0)])
-
   def test_nvidia_fixed_page_map_routes_each_queue_region(self):
-    queue = ASM24GSPQueueInterface(self.controller, 0xB000, page_paddrs=ASM24GSPQueueInterface.NVIDIA_PAGE_PADDRS)
-    self.assertEqual(queue.paddrs(), list(ASM24GSPQueueInterface.NVIDIA_PAGE_PADDRS))
+    queue = self.queue
+    self.assertEqual(queue.paddrs(), list(ASM24GSPQueueInterface.PAGE_PADDRS))
 
     queue[0:4] = b"PTES"
     queue.view(0x1000)[0:4] = b"CMDH"
@@ -367,10 +330,6 @@ class TestASM24GSPQueueInterface(unittest.TestCase):
                      [(4, b"PTES"), (20, b"CMDH"), (19, b"CMD0")])
     xdata_writes = [write for write in self.controller.writes if write[0] == "xdata"]
     self.assertEqual(xdata_writes, [("xdata", 0xB800, b"STAH"), ("xdata", 0xA000, b"STA0"), ("xdata", 0xF000, b"STA1")])
-
-    queue.arm_read()
-    queue.sync()
-    self.assertEqual(self.controller.read_arms, [])
 
 
 if __name__ == "__main__": unittest.main()

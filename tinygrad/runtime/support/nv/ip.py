@@ -147,7 +147,6 @@ class NVRpcQueue:
     System.memory_barrier()
 
     self.seq += 1
-    if (arm_read:=getattr(self.gsp.nvdev.pci_dev, "arm_gsp_queue_read", None)) is not None: arm_read()
     if self._direct_transport and hasattr(self.gsp, "stat_q"): self.gsp.invalidate_rpc_memory()
     self.gsp.nvdev.NV_PGSP_QUEUE_HEAD[0].write(0x0)
 
@@ -162,7 +161,6 @@ class NVRpcQueue:
       yield from self._read_direct_resp()
       return
     while self.rx_view[0] != self.tx_view[getattr(nv.msgqTxHeader, 'writePtr').offset // 4]:
-      if (sync:=getattr(self.gsp.nvdev.pci_dev, "sync_gsp_queue", None)) is not None: sync()
       elem, hdr, raw = self._read_record(self.rx_view[0])
       # Update the read pointer
       self.rx_view[0] = (self.rx_view[0] + elem.elemCount) % self.tx.msgCount
@@ -458,6 +456,10 @@ class NV_GSP(NV_IP):
     reg.write(1)
     wait_cond(lambda: reg.read() & 0x3, value=0, msg="GSP RPC memory invalidate did not complete")
 
+  def _stage_args(self, data:bytes, offset:int) -> int:
+    if (stage:=getattr(self.nvdev.pci_dev, "stage_gsp_args", None)) is not None: return stage(data, offset)
+    return self.nvdev._alloc_boot_mem(len(data), data=data)[2][0]
+
   def init_sw(self):
     self.handle_gen = itertools.count(0xcf000000)
     self.init_rm_args()
@@ -490,11 +492,7 @@ class NV_GSP(NV_IP):
     queue_args = nv.MESSAGE_QUEUE_INIT_ARGUMENTS(sharedMemPhysAddr=queues_sysmem[0], pageTableEntryCount=pte_cnt, cmdQueueOffset=pt_size,
       statQueueOffset=pt_size + queue_size)
     rm_args = bytes(nv.GSP_ARGUMENTS_CACHED(bDmemStack=True, messageQueueInitArguments=queue_args))
-    if (stage_rm_args:=getattr(self.nvdev.pci_dev, "stage_gsp_rm_args", None)) is not None:
-      self.rm_args_sysmem = stage_rm_args(rm_args)
-    else:
-      _, _, rm_args_addrs = self.nvdev._alloc_boot_mem(len(rm_args), data=rm_args)
-      self.rm_args_sysmem = rm_args_addrs[0]
+    self.rm_args_sysmem = self._stage_args(rm_args, 0x100)
 
     # Build command queue header
     # self.cmd_q_va, self.stat_q_va = queues_view.addr + pt_size, queues_view.addr + pt_size + queue_size
@@ -514,17 +512,13 @@ class NV_GSP(NV_IP):
     libos_structs.append(nv.LibosMemoryRegionInitArgument(kind=nv.LIBOS_MEMORY_REGION_CONTIGUOUS, loc=nv.LIBOS_MEMORY_REGION_LOC_SYSMEM, size=0x1000,
         id8=int.from_bytes(bytes("RMARGS", 'utf-8'), 'big'), pa=self.rm_args_sysmem))
     args = b''.join(bytes(s) for s in libos_structs)
-    if (stage_libos_args:=getattr(self.nvdev.pci_dev, "stage_gsp_libos_args", None)) is not None:
-      self.libos_args_sysmem = stage_libos_args(args)
-    else:
-      libos_args_view, _, libos_addrs = self.nvdev._alloc_boot_mem(0x1000)
-      self.libos_args_sysmem = libos_addrs[0]
-      libos_args_view[:len(args)] = args
+    self.libos_args_sysmem = self._stage_args(args, 0x200)
 
   def init_gsp_image(self):
     _, sections, _ = elf_loader(fetch_fw("nvidia/ga102/gsp", "gsp-570.144.bin", "a8c3ebeed280323aedb51c061f321e73379cce7a9ae643a33dd03915df027f7f"))
     self.gsp_image = next((sh.content for sh in sections if sh.name == ".fwimage"))
     self.gsp_signature = bytes(next((sh.content for sh in sections if sh.name == (f".fwsignature_{self.nvdev.chip_name[:4].lower()}x"))))
+    if getattr(self.nvdev.pci_dev, "gsp_sram_boot", False): return
 
     # Build radix3
     npages = [0, 0, 0, round_up(len(self.gsp_image), 0x1000) // 0x1000]
@@ -551,8 +545,8 @@ class NV_GSP(NV_IP):
            "gb202":"d40b48e431d1707dc77af3605db358ed7a32ebfc2830eb74de2eddb4d3025071"}[self.nvdev.fw_name]
     h = nv.struct_nvfw_bin_hdr.from_buffer_copy(b:=fetch_fw(f"nvidia/{self.nvdev.fw_name}/gsp", "bootloader-570.144.bin", sha))
     self.booter_image, self.booter_desc = b[h.data_offset:h.data_offset+h.data_size], nv.RM_RISCV_UCODE_DESC.from_buffer_copy(b, h.header_offset)
-    _, _, booter_addrs = self.nvdev._alloc_boot_mem(len(self.booter_image), data=self.booter_image)
-    self.booter_bar1 = booter_addrs[0]
+    if not getattr(self.nvdev.pci_dev, "gsp_sram_boot", False):
+      self.booter_bar1 = self.nvdev._alloc_boot_mem(len(self.booter_image), data=self.booter_image)[2][0]
 
   def _build_sram_wpr(self, meta:nv.GspFwWprMeta) -> bytes:
     page_size, sram_size = 0x1000, 0x80000
@@ -591,10 +585,11 @@ class NV_GSP(NV_IP):
   def init_wpr_meta(self):
     self.init_gsp_image()
     self.init_boot_binary_image()
+    sram_boot = getattr(self.nvdev.pci_dev, "gsp_sram_boot", False)
 
-    common = {'sizeOfBootloader':(boot_sz:=len(self.booter_image)), 'sysmemAddrOfBootloader':self.booter_bar1,
-      'sizeOfRadix3Elf':(radix3_sz:=len(self.gsp_image)), 'sysmemAddrOfRadix3Elf': self.gsp_radix3_addrs[0],
-      'sizeOfSignature': 0x1000, 'sysmemAddrOfSignature': self.gsp_signature_bar1,
+    common = {'sizeOfBootloader':(boot_sz:=len(self.booter_image)), 'sysmemAddrOfBootloader':0 if sram_boot else self.booter_bar1,
+      'sizeOfRadix3Elf':(radix3_sz:=len(self.gsp_image)), 'sysmemAddrOfRadix3Elf':0 if sram_boot else self.gsp_radix3_addrs[0],
+      'sizeOfSignature': 0x1000, 'sysmemAddrOfSignature':0 if sram_boot else self.gsp_signature_bar1,
       'bootloaderCodeOffset': self.booter_desc.monitorCodeOffset, 'bootloaderDataOffset': self.booter_desc.monitorDataOffset,
       'bootloaderManifestOffset': self.booter_desc.manifestOffset, 'revision':nv.GSP_FW_WPR_META_REVISION, 'magic':nv.GSP_FW_WPR_META_MAGIC}
 
@@ -608,9 +603,11 @@ class NV_GSP(NV_IP):
         gspFwHeapOffset=(gsp_heap_off:=round_down(gsp_off-gsp_heap_sz, 0x100000)), gspFwWprStart=(wpr_st:=round_down(gsp_heap_off-0x1000, 0x100000)),
         nonWprHeapSize=(non_wpr_sz:=0x100000), nonWprHeapOffset=(non_wpr_off:=round_down(wpr_st-non_wpr_sz, 0x100000)), gspFwRsvdStart=non_wpr_off)
       assert self.nvdev.flcn.frts_offset == m.frtsOffset, f"FRTS mismatch: {self.nvdev.flcn.frts_offset} != {m.frtsOffset}"
-    if getattr(self.nvdev.pci_dev, "gsp_sram_boot", False): self._boot_sram = self._build_sram_wpr(m)
-    self.wpr_meta, _, wpr_meta_addrs = self.nvdev._alloc_boot_mem(ctypes.sizeof(type(m)), data=bytes(m))
-    self.wpr_meta_sysmem = 0x200000 if hasattr(self, "_boot_sram") else wpr_meta_addrs[0]
+    if sram_boot:
+      self._boot_sram, self.wpr_meta_sysmem = self._build_sram_wpr(m), 0x200000
+    else:
+      self.wpr_meta, _, wpr_meta_addrs = self.nvdev._alloc_boot_mem(ctypes.sizeof(type(m)), data=bytes(m))
+      self.wpr_meta_sysmem = wpr_meta_addrs[0]
 
   def promote_ctx(self, client:int, subdevice:int, obj:int, ctxbufs:dict[int, GRBufDesc], bufs=None, virt=None, phys=None):
     res, prom = {}, nv_gpu.NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS(entryCount=len(ctxbufs), engineType=0x1, hChanClient=client, hObject=obj)

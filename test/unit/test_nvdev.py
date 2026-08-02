@@ -1,5 +1,5 @@
 import ctypes, types, unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from tinygrad.runtime.autogen import nv_regs
 from tinygrad.runtime.support.hcq import MMIOInterface
@@ -46,11 +46,6 @@ class TestNVBootMemory(unittest.TestCase):
     dev.pci_dev.bar_info.assert_called_once_with(1)
 
 
-class SparseMMIO:
-  def __init__(self): self.values = {}
-  def __getitem__(self, index): return self.values.get(index, 0)
-
-
 def ifr_vbios_words(version:int=3) -> dict[int, int]:
   words = {0: 0x4947564E, 4: (0x24 << 16) | (version << 8), 0x2000: 0xAA55}
   if version in (1, 2): words[0x28] = 0x2000
@@ -79,57 +74,6 @@ class TestNVVBIOSLayout(unittest.TestCase):
     words[0x28] = 0x2001
     with self.assertRaisesRegex(ValueError, "PCI option ROM offset"):
       find_vbios_rom_offset(words.get)
-
-
-class TestNVUSBRecovery(unittest.TestCase):
-  @staticmethod
-  def make_dev(valid_vbios:bool, ifr:bool=False):
-    dev = object.__new__(NVDev)
-    dev.devfmt, dev.mmio = "usb:test", SparseMMIO()
-    if valid_vbios:
-      words = ifr_vbios_words() if ifr else {0: 0xAA55}
-      dev.mmio.values.update({(dev._VBIOS_BASE + off) // 4: value for off, value in words.items()})
-    dev.pci_dev = MagicMock(boot_mem_in_vram=True)
-    dev.pci_dev.read_config.return_value = 0x7
-    wpr = MagicMock()
-    wpr.read.return_value = 0
-    dev.reg = MagicMock(return_value=wpr)
-    return dev
-
-  @patch("tinygrad.runtime.support.nv.nvdev.time.sleep")
-  def test_invalid_usb_vbios_triggers_one_reset(self, sleep):
-    dev = self.make_dev(False)
-    def restore_vbios(): dev.mmio.values[dev._VBIOS_BASE // 4] = 0xAA55
-    dev.pci_dev.reset.side_effect = restore_vbios
-
-    dev._reset_stale_state()
-
-    dev.pci_dev.reset.assert_called_once_with()
-    sleep.assert_called_once_with(0.1)
-
-  @patch("tinygrad.runtime.support.nv.nvdev.time.sleep")
-  def test_persistent_invalid_usb_vbios_requests_physical_reset(self, sleep):
-    dev = self.make_dev(False)
-
-    with self.assertRaisesRegex(RuntimeError, "physically power-cycle"):
-      dev._reset_stale_state()
-
-    dev.pci_dev.reset.assert_called_once_with()
-    sleep.assert_called_once_with(0.1)
-
-  def test_valid_idle_usb_device_is_not_reset(self):
-    dev = self.make_dev(True)
-
-    dev._reset_stale_state()
-
-    dev.pci_dev.reset.assert_not_called()
-
-  def test_valid_ifr_idle_usb_device_is_not_reset(self):
-    dev = self.make_dev(True, ifr=True)
-
-    dev._reset_stale_state()
-
-    dev.pci_dev.reset.assert_not_called()
 
 
 class TestNVCPUVisibleMemory(unittest.TestCase):
