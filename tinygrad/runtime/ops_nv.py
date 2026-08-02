@@ -134,8 +134,9 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
     gpfifo.ring[ring_index], gpfifo.gpput[0] = ring_value, put_value
 
     System.memory_barrier()
-    if (flush_writes:=getattr(dev.iface.pci_dev, "flush_writes", None)) is not None: flush_writes()
-    if getattr(dev.iface.pci_dev, "verify_bar_writes", False):
+    pci_dev = getattr(dev.iface, "pci_dev", None)
+    if (flush_writes:=getattr(pci_dev, "flush_writes", None)) is not None: flush_writes()
+    if getattr(pci_dev, "verify_bar_writes", False):
       if (observed:=gpfifo.ring[ring_index]) != ring_value:
         raise RuntimeError(f"GPFIFO BAR write verification failed at entry {ring_index:#x}: {observed:#x} != {ring_value:#x}")
       if (observed:=gpfifo.gpput[0]) != put_value:
@@ -785,11 +786,12 @@ class NVDevice(HCQCompiled[NVSignal]):
     if ctxshare != 0: self.iface.setup_gpfifo_vm(gpfifo)
 
     userd = gpfifo_area.cpu_view().view(offset + entries*8)
-    ring_paddr = gpfifo_area.meta.mapping.paddrs[0][0] + offset
+    mapping = getattr(gpfifo_area.meta, "mapping", None)
+    ring_paddr = mapping.paddrs[0][0] + offset if mapping is not None else None
     return GPFifo(ring=gpfifo_area.cpu_view().view(offset, entries*8, fmt='Q'), entries_count=entries, token=ws_token_params.workSubmitToken,
                   gpget=userd.view(getattr(nv_gpu.AmpereAControlGPFifo, 'GPGet').offset, 4, fmt='I'),
                   gpput=userd.view(getattr(nv_gpu.AmpereAControlGPFifo, 'GPPut').offset, 4, fmt='I'), channel=gpfifo,
-                  ring_paddr=ring_paddr, userd_paddr=ring_paddr + entries*8)
+                  ring_paddr=ring_paddr, userd_paddr=ring_paddr + entries*8 if ring_paddr is not None else None)
 
   def _query_gpu_info(self, *reqs):
     nvrs = [getattr(nv_gpu,'NV2080_CTRL_GR_INFO_INDEX_'+r.upper(), getattr(nv_gpu,'NV2080_CTRL_GR_INFO_INDEX_LITTER_'+r.upper(), None)) for r in reqs]

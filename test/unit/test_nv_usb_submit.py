@@ -1,7 +1,7 @@
 import types, unittest
 from unittest.mock import MagicMock, patch
 
-from tinygrad.runtime.ops_nv import GPFifo, NVCommandQueue, NVSignal, USBIface
+from tinygrad.runtime.ops_nv import GPFifo, NVCommandQueue, NVDevice, NVSignal, USBIface
 from tinygrad.runtime.support.hcq import HCQSignal
 
 
@@ -16,6 +16,32 @@ class RecordingMMIO:
 
 
 class TestNVUSBSubmission(unittest.TestCase):
+  def test_gpfifo_diagnostics_allow_non_pci_allocation_metadata(self):
+    dev = object.__new__(NVDevice)
+    dev.nvdevice, dev.virtmem = 0xC1000001, 0xC1000002
+    dev.iface = MagicMock(gpfifo_class=0xC36F, dma_class=0xC3B5)
+    dev.iface.alloc.return_value.meta.hMemory = 0xC1000003
+    dev.iface.rm_alloc.side_effect = [0xC1000004, 0xC1000005]
+    dev.iface.rm_control.return_value.workSubmitToken = 0x1234
+    area = MagicMock(va_addr=0x100000, meta=types.SimpleNamespace(hMemory=0xC1000006))
+
+    fifo = dev._new_gpu_fifo(area, ctxshare=0, channel_group=0xC1000007, offset=0x2000, entries=16)
+
+    self.assertIsNone(fifo.ring_paddr)
+    self.assertIsNone(fifo.userd_paddr)
+
+  def test_submission_without_pci_transport(self):
+    events = []
+    dev = types.SimpleNamespace(iface=types.SimpleNamespace(), gpu_mmio=RecordingMMIO(events, "doorbell"))
+    queue = object.__new__(NVCommandQueue)
+    queue.binded_device, queue.hw_page, queue._q = dev, types.SimpleNamespace(va_addr=0x1000), [0, 0]
+    gpfifo = GPFifo(RecordingMMIO(events, "ring"), RecordingMMIO(events, "gpput"), 16, token=0x1234)
+
+    with patch("tinygrad.runtime.ops_nv.System.memory_barrier", MagicMock()): queue._submit_to_gpfifo(dev, gpfifo)
+
+    self.assertEqual([event[0] for event in events], ["ring", "gpput", "doorbell"])
+    queue.binded_device = None
+
   def test_flushes_bar_writes_before_and_after_doorbell(self):
     events = []
     pci_dev = types.SimpleNamespace(flush_writes=lambda: events.append(("flush",)))
