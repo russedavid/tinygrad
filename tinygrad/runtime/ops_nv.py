@@ -7,13 +7,14 @@ from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, H
 from tinygrad.runtime.support.hcq import MMIOInterface, FileIOInterface, hcq_filter_visible_devices, hcq_profile
 from tinygrad.uop.ops import sint
 from tinygrad.device import Compiled, BufferSpec, TinyELF
-from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent
+from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent, pluralize
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager
-from tinygrad.runtime.support.system import System, PCIIfaceBase, MAP_FIXED
+from tinygrad.runtime.support.system import System, PCIIfaceBase, USBPCIDevice, MAP_FIXED
+from tinygrad.runtime.support.usb import USB3
 from tinygrad.renderer.nir import NAKRenderer
 if getenv("IOCTL"): import extra.nv_gpu_driver.nv_ioctl # noqa: F401 # pylint: disable=unused-import
 
@@ -28,6 +29,16 @@ class NVSignal(HCQSignal):
   def _sleep(self, time_spent_since_last_sleep_ms:int):
     # Reasonable to sleep for long workloads (which take more than 200ms) and only timeline signals.
     if time_spent_since_last_sleep_ms > 200 and self.owner is not None: self.owner.iface.sleep(200)
+
+  def wait(self, value:int, timeout:int|None=None):
+    try: return super().wait(value, timeout)
+    except RuntimeError as exc:
+      diagnostics = getattr(self.owner.iface, "gpfifo_diagnostics", None) if self.owner is not None else None
+      if diagnostics is not None:
+        try: detail = diagnostics()
+        except Exception: pass
+        else: raise RuntimeError(f"{exc}; {detail}") from exc
+      raise
 
 def get_error_str(status): return f"{status}: {nv_gpu.nv_status_codes.get(status, 'Unknown error')}"
 
@@ -118,11 +129,20 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
       cmdq_wptr = (cmdq_addr - dev.cmdq_page.va_addr) // 4
       dev.cmdq[cmdq_wptr : cmdq_wptr + len(self._q)] = array.array('I', self._q)
 
-    gpfifo.ring[gpfifo.put_value % gpfifo.entries_count] = (cmdq_addr//4 << 2) | (len(self._q) << 42) | (1 << 41)
-    gpfifo.gpput[0] = (gpfifo.put_value + 1) % gpfifo.entries_count
+    ring_index, ring_value = gpfifo.put_value % gpfifo.entries_count, (cmdq_addr//4 << 2) | (len(self._q) << 42) | (1 << 41)
+    put_value = (gpfifo.put_value + 1) % gpfifo.entries_count
+    gpfifo.ring[ring_index], gpfifo.gpput[0] = ring_value, put_value
 
     System.memory_barrier()
-    dev.gpu_mmio[0x90 // 4] = gpfifo.token
+    if (flush_writes:=getattr(dev.iface.pci_dev, "flush_writes", None)) is not None: flush_writes()
+    if getattr(dev.iface.pci_dev, "verify_bar_writes", False):
+      if (observed:=gpfifo.ring[ring_index]) != ring_value:
+        raise RuntimeError(f"GPFIFO BAR write verification failed at entry {ring_index:#x}: {observed:#x} != {ring_value:#x}")
+      if (observed:=gpfifo.gpput[0]) != put_value:
+        raise RuntimeError(f"GPPut BAR write verification failed: {observed:#x} != {put_value:#x}")
+    submit_token = getattr(dev.iface, "gpfifo_submit_token", lambda token: token)(gpfifo.token)
+    dev.gpu_mmio[0x90 // 4] = submit_token
+    if flush_writes is not None: flush_writes()
     gpfifo.put_value += 1
 
 class NVComputeQueue(NVCommandQueue):
@@ -339,6 +359,8 @@ class NVProgram(HCQProgram['NVDevice']):
     return res
 
 class NVAllocator(HCQAllocator['NVDevice']):
+  def __init__(self, dev): super().__init__(dev, batch_cnt=getattr(dev.iface, "copy_batch_cnt", 32))
+
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:
     return self.dev.iface.alloc(size, cpu_access=options.cpu_access, host=options.host)
 
@@ -365,7 +387,11 @@ class GPFifo:
   gpput: MMIOInterface
   entries_count: int
   token: int
+  gpget: MMIOInterface|None = None
   put_value: int = 0
+  channel: int|None = None
+  ring_paddr: int|None = None
+  userd_paddr: int|None = None
 
 class NVKIface:
   root = None
@@ -560,6 +586,10 @@ class PCIIface(PCIIfaceBase):
     super().__init__(dev, dev_id, vendor=0x10de, devices=((0xff00, (0x2200,0x2400,0x2500,0x2600,0x2700,0x2800,0x2b00,0x2c00,0x2d00,0x2f00)),),
       base_class=0x03, vram_bar=1, va_start=NVMemoryManager.va_allocator.base, va_size=NVMemoryManager.va_allocator.size, dev_impl_t=NVDev)
 
+    self._init_nvd()
+
+  def _init_nvd(self):
+
     self.root, self.gpu_instance = 0xc1000000, 0
     self.rm_alloc(0, nv_gpu.NV01_ROOT, nv_gpu.NV0000_ALLOC_PARAMETERS())
 
@@ -580,10 +610,102 @@ class PCIIface(PCIIfaceBase):
     for _ in self.dev_impl.gsp.stat_q.read_resp(): pass
     if self.dev_impl.is_err_state: raise RuntimeError("Device fault detected")
 
+class USBIface(PCIIface):
+  _ENGINE_INFO_RUNLIST, _ENGINE_INFO_RUNLIST_PRI_BASE, _ENGINE_INFO_CHRAM_PRI_BASE = 3, 11, 14
+  # The fixed 256 MiB BAR1 also contains boot and kernel-argument allocations; triple buffering fits the remaining aperture.
+  copy_batch_cnt = 3
+
+  def __init__(self, dev, dev_id): # pylint: disable=super-init-not-called
+    if NVKIface.root is not None: raise RuntimeError("Cannot use USBIface after NVKIface has been initialized (would corrupt UVM memory)")
+    usb_devices = USB3.list_devices(0xADD1, 0x0001) + USB3.list_devices(0x3801, 0x0001)
+    if dev_id >= len(visible:=hcq_filter_visible_devices(usb_devices, "NV")):
+      raise RuntimeError(f"NV:{dev_id} does not exist ({pluralize('device', len(visible))} available)")
+    self.dev, self.pci_dev, self.vram_bar, self.count = dev, USBPCIDevice("NV", *visible[dev_id]), 1, len(visible)
+    self.dev_impl = NVDev(self.pci_dev)
+    self._init_nvd()
+
+  def setup_usermode(self):
+    # UVM submits Ampere and Ada channels through the engine's internal runlist doorbell. The virtual-function doorbell is used on Hopper+.
+    self._runlist_doorbell = self.dev_impl.chip_name.startswith(("GA", "AD"))
+    if not self._runlist_doorbell: return super().setup_usermode()
+
+    params = nv_gpu.NV2080_CTRL_GPU_GET_ENGINE_RUNLIST_PRI_BASE_PARAMS()
+    params.engineList[0] = nv_gpu.NV2080_ENGINE_TYPE_GRAPHICS
+    info = self.rm_control(self.dev.subdevice, nv_gpu.NV2080_CTRL_CMD_GPU_GET_ENGINE_RUNLIST_PRI_BASE, params)
+    self.runlist_pri_base, self.runlist_id = int(info.runlistPriBase[0]), int(info.runlistId[0])
+    invalid = (nv_gpu.NV2080_CTRL_GPU_GET_ENGINE_RUNLIST_PRI_BASE_NULL, nv_gpu.NV2080_CTRL_GPU_GET_ENGINE_RUNLIST_PRI_BASE_ERROR)
+    if self.runlist_pri_base in invalid:
+      raise RuntimeError(f"Unable to resolve graphics runlist doorbell: base={self.runlist_pri_base:#x}, runlist={self.runlist_id:#x}")
+    usermode = self.pci_dev.map_bar(bar=0, fmt='I', off=self.runlist_pri_base, size=0x1000)
+
+    # CHRAM exposes whether HOST saw a doorbell and where a channel stopped. It is optional diagnostic state.
+    self.chram_mmio:MMIOInterface|None = None
+    base_index = 0
+    while True:
+      table = self.rm_control(self.dev.subdevice, nv_gpu.NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE,
+        nv_gpu.NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS(baseIndex=base_index))
+      entry = next((entry for entry in table.entries[:table.numEntries]
+                    if entry.engineData[self._ENGINE_INFO_RUNLIST] == self.runlist_id and
+                       entry.engineData[self._ENGINE_INFO_RUNLIST_PRI_BASE] == self.runlist_pri_base), None)
+      if entry is not None:
+        self.chram_pri_base = int(entry.engineData[self._ENGINE_INFO_CHRAM_PRI_BASE])
+        self.chram_mmio = self.pci_dev.map_bar(bar=0, fmt='I', off=self.chram_pri_base, size=0x2000)
+        break
+      if not table.bMore or table.numEntries == 0: break
+      base_index += table.numEntries
+    return 0xce000000, usermode
+
+  def gpfifo_submit_token(self, token:int) -> int:
+    # NV_RUNLIST_INTERNAL_DOORBELL_CHID_HW is bits 10:0; virtual doorbells consume the complete RM token.
+    return token & 0x7ff if getattr(self, "_runlist_doorbell", False) else token
+
+  def gpfifo_health(self) -> tuple[dict[str, int|None], list[tuple[int, int, int]]]:
+    channels:dict[str, int|None] = {}
+    for name in ("compute", "dma"):
+      if (fifo:=getattr(self.dev, f"{name}_gpfifo", None)) is None: continue
+      chid = self.gpfifo_submit_token(fifo.token) & 0x7ff
+      chram_mmio = getattr(self, "chram_mmio", None)
+      channels[name] = chram_mmio[chid] if chram_mmio is not None else None
+    aer = [(bus, self.pci_dev.usb.pcie_cfg_req(0x104, bus=bus, size=4), self.pci_dev.usb.pcie_cfg_req(0x110, bus=bus, size=4))
+           for bus in range(self.pci_dev.gpu_bus + 1)]
+    return channels, aer
+
+  def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, **kwargs) -> HCQBuffer:
+    # USB has no host-memory aperture, so keep host buffers in VRAM and expose them through BAR1.
+    # Host staging buffers are reused after CPU BAR writes, so their GPU mappings must bypass stale L2 data.
+    ret = super().alloc(size, host=False, uncached=uncached or host, cpu_access=cpu_access,
+                        contiguous=contiguous or host, force_devmem=True,
+                        cpu_visible=host or cpu_access,
+                        **kwargs)
+    if host and not cpu_access:
+      ret.view = self.pci_dev.map_bar(self.vram_bar, off=ret.meta.mapping.paddrs[0][0], size=ret.meta.mapping.size)
+    # USBMMIOInterface is a transport object, not a process mapping at ret.va_addr.
+    ret.meta.has_cpu_mapping = False
+    return ret
+
+  def gpfifo_diagnostics(self) -> str:
+    channel_health, aer = self.gpfifo_health()
+    states = []
+    for name in ("compute", "dma"):
+      if (fifo:=getattr(self.dev, f"{name}_gpfifo", None)) is None: continue
+      index = (fifo.put_value - 1) % fifo.entries_count
+      chram = channel_health[name]
+      chram_state = "unavailable" if chram is None else \
+        f"{chram:#x}[enable={(chram >> 1) & 1}, next={(chram >> 2) & 1}, busy={(chram >> 3) & 1}, " \
+        f"pbdma_faulted={(chram >> 4) & 1}, eng_faulted={(chram >> 5) & 1}, on_pbdma={(chram >> 6) & 1}, " \
+        f"on_eng={(chram >> 7) & 1}, pending={(chram >> 8) & 1}, acquire_fail={(chram >> 12) & 1}]"
+      states.append(f"{name}(channel={fifo.channel if fifo.channel is not None else -1:#x}, token={fifo.token:#x}, "
+                    f"doorbell_token={self.gpfifo_submit_token(fifo.token):#x}, "
+                    f"ring_paddr={fifo.ring_paddr if fifo.ring_paddr is not None else -1:#x}, "
+                    f"userd_paddr={fifo.userd_paddr if fifo.userd_paddr is not None else -1:#x}, "
+                    f"host_put={fifo.put_value:#x}, GPPut={fifo.gpput[0]:#x}, "
+                    f"GPGet={fifo.gpget[0] if fifo.gpget is not None else -1:#x}, ring[{index:#x}]={fifo.ring[index]:#x}, CHRAM={chram_state})")
+    return f"USB GPFIFO state: {', '.join(states)}; AER={[(bus, hex(unc), hex(cor)) for bus, unc, cor in aer]}"
+
 class MOCKIface(NVKIface): count = 1
 
 class NVDevice(HCQCompiled[NVSignal]):
-  ifaces = [NVKIface, PCIIface, MOCKIface]
+  ifaces = [NVKIface, PCIIface, USBIface, MOCKIface]
 
   def is_nvd(self) -> bool: return isinstance(self.iface, PCIIface)
 
@@ -662,8 +784,12 @@ class NVDevice(HCQCompiled[NVSignal]):
       nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS(workSubmitToken=-1))
     if ctxshare != 0: self.iface.setup_gpfifo_vm(gpfifo)
 
+    userd = gpfifo_area.cpu_view().view(offset + entries*8)
+    ring_paddr = gpfifo_area.meta.mapping.paddrs[0][0] + offset
     return GPFifo(ring=gpfifo_area.cpu_view().view(offset, entries*8, fmt='Q'), entries_count=entries, token=ws_token_params.workSubmitToken,
-                  gpput=gpfifo_area.cpu_view().view(offset + entries*8 + getattr(nv_gpu.AmpereAControlGPFifo, 'GPPut').offset, fmt='I'))
+                  gpget=userd.view(getattr(nv_gpu.AmpereAControlGPFifo, 'GPGet').offset, 4, fmt='I'),
+                  gpput=userd.view(getattr(nv_gpu.AmpereAControlGPFifo, 'GPPut').offset, 4, fmt='I'), channel=gpfifo,
+                  ring_paddr=ring_paddr, userd_paddr=ring_paddr + entries*8)
 
   def _query_gpu_info(self, *reqs):
     nvrs = [getattr(nv_gpu,'NV2080_CTRL_GR_INFO_INDEX_'+r.upper(), getattr(nv_gpu,'NV2080_CTRL_GR_INFO_INDEX_LITTER_'+r.upper(), None)) for r in reqs]

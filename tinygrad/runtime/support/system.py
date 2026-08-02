@@ -4,7 +4,7 @@ from tinygrad.helpers import round_up, getenv, OSX, temp, ceildiv, unwrap, fetch
 from tinygrad.runtime.autogen import libc, pci, vfio, iokit, corefoundation
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface, HCQBuffer, hcq_filter_visible_devices
 from tinygrad.runtime.support.memory import VirtMapping, AddrSpace, BumpAllocator
-from tinygrad.runtime.support.usb import USB3, CustomASM24Controller, USBMMIOInterface
+from tinygrad.runtime.support.usb import USB3, CustomASM24Controller, USBMMIOInterface, ASM24GSPQueueInterface
 
 MAP_FIXED, MAP_FIXED_NOREPLACE = 0x10, 0x100000
 MAP_LOCKED, MAP_POPULATE, MAP_NORESERVE = 0 if OSX else 0x2000, getattr(mmap, "MAP_POPULATE", 0 if OSX else 0x008000), 0x400
@@ -85,10 +85,25 @@ class _System:
     except IndexError: raise RuntimeError(f"{device}:{dev_id} does not exist ({pluralize('device', len(ds))} available)")
     return cl(device[:2], pcibus)
 
+  def pci_find_usb_endpoint(self, usb:CustomASM24Controller, max_bus:int=32) -> int:
+    for bus in range(max_bus):
+      identity = usb.pcie_cfg_req(pci.PCI_VENDOR_ID, bus=bus, dev=0, fn=0, size=4)
+      if identity in (0, 0xffffffff): raise RuntimeError(f"Invalid PCIe identity {identity:#010x} on bus {bus}")
+
+      header_type = usb.pcie_cfg_req(pci.PCI_HEADER_TYPE, bus=bus, dev=0, fn=0, size=1) & pci.PCI_HEADER_TYPE_MASK
+      if header_type == pci.PCI_HEADER_TYPE_NORMAL: return bus
+      if header_type != pci.PCI_HEADER_TYPE_BRIDGE:
+        raise RuntimeError(f"Unsupported PCIe header type {header_type:#x} on bus {bus} ({identity & 0xffff:04x}:{identity >> 16:04x})")
+
+      # Open the bridge far enough to discover the next device. The final subordinate bus is tightened once the endpoint is known.
+      buses = (bus << 0) | ((bus + 1) << 8) | (0xff << 16)
+      usb.pcie_cfg_req(pci.PCI_PRIMARY_BUS, bus=bus, dev=0, fn=0, value=buses, size=4)
+    raise RuntimeError(f"PCIe endpoint not found within {max_bus} buses")
+
   def pci_setup_usb_bars(self, usb:CustomASM24Controller, gpu_bus:int, mem_base:int, pref_mem_base:int) -> dict[int, tuple[int, int]]:
     for bus in range(gpu_bus):
       # All 3 values must be written at the same time.
-      buses = (0 << 0) | ((bus+1) << 8) | ((gpu_bus) << 16)
+      buses = (bus << 0) | ((bus+1) << 8) | ((gpu_bus) << 16)
       usb.pcie_cfg_req(pci.PCI_PRIMARY_BUS, bus=bus, dev=0, fn=0, value=buses, size=4)
 
       usb.pcie_cfg_req(pci.PCI_MEMORY_BASE, bus=bus, dev=0, fn=0, value=(mem_base>>16) & 0xffff, size=2)
@@ -223,24 +238,114 @@ class PCIDevice:
 
 class USBPCIDevice(PCIDevice):
   def __init__(self, devpref:str, dev, pcibus):
-    self.pcibus, self.peer_group = pcibus, f"USBPCIDevice_{pcibus}"
+    self.devpref, self.pcibus, self.peer_group = devpref, pcibus, f"USBPCIDevice_{pcibus}"
+    self.boot_mem_in_vram = devpref == "NV"
+    self.gsp_queue_size = 0x5000 if devpref == "NV" else None
+    # Initial GA102 boot drains hundreds of fixed-window NOCAT records before CPU-sequencer/INIT_DONE.
+    self.gsp_rpc_timeout_ms = 120000 if devpref == "NV" else None
+    self.skip_gsp_registry = devpref == "NV"
+    self.gsp_sram_boot = devpref == "NV"
+    self.verify_bar_writes = devpref == "NV"
     self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
     usb = USB3(dev)
-    if DEBUG >= 1: print(f"am {self.pcibus}: product string: {usb.product!r}")
-    self.usb: CustomASM24Controller = CustomASM24Controller(usb)
-    self._bar_info = System.pci_setup_usb_bars(self.usb, gpu_bus=4, mem_base=0x10000000, pref_mem_base=(32 << 30))
+    if DEBUG >= 1: print(f"{devpref.lower()} {self.pcibus}: product string: {usb.product!r}")
+    self.usb: CustomASM24Controller = CustomASM24Controller(usb, minimum_revision=3 if devpref == "NV" else None)
+    self._setup_pcie()
     self.sram = BumpAllocator(size=0x80000, wrap=False) # asm24 controller sram
+
+  def _setup_pcie(self):
+    self.gpu_bus = System.pci_find_usb_endpoint(self.usb)
+    identity = self.usb.pcie_cfg_req(pci.PCI_VENDOR_ID, bus=self.gpu_bus, dev=0, fn=0, size=4)
+    expected_vendor = {"AM": 0x1002, "NV": 0x10de}.get(self.devpref)
+    if expected_vendor is not None and (vendor:=identity & 0xffff) != expected_vendor:
+      raise RuntimeError(f"Expected {self.devpref} GPU, found {vendor:04x}:{identity >> 16:04x} on PCI bus {self.gpu_bus}")
+    if DEBUG >= 1: print(f"{self.devpref.lower()} {self.pcibus}: PCIe endpoint {identity & 0xffff:04x}:{identity >> 16:04x} on bus {self.gpu_bus}")
+    self._bar_info = System.pci_setup_usb_bars(self.usb, self.gpu_bus, mem_base=0x10000000, pref_mem_base=(32 << 30))
 
   def dma_view(self, ctrl_addr, size): return USBMMIOInterface(self.usb, ctrl_addr, size, fmt='B', pcimem=False)
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
     return self.dma_view(0xf000 + (off:=self.sram.alloc(size)), size), [0x200000 + off]
 
-  def read_config(self, offset:int, size:int): return self.usb.pcie_cfg_req(offset, bus=4, dev=0, fn=0, size=size)
-  def write_config(self, offset:int, value:int, size:int): self.usb.pcie_cfg_req(offset, bus=4, dev=0, fn=0, value=value, size=size)
+  def alloc_gsp_queues(self, size:int) -> tuple[MMIOInterface, list[int]]:
+    page_paddrs = ASM24GSPQueueInterface.NVIDIA_PAGE_PADDRS if self.devpref == "NV" else None
+    self.gsp_queues = ASM24GSPQueueInterface(self.usb, size, page_paddrs=page_paddrs)
+    return self.gsp_queues, self.gsp_queues.paddrs()
+
+  def stage_gsp_rm_args(self, data:bytes) -> int:
+    assert len(data) <= 0x100
+    self._gsp_rm_args_page = data + bytes(0x100 - len(data))
+    self.usb.write(0xB900, self._gsp_rm_args_page)
+    return 0x828100
+
+  def stage_gsp_libos_args(self, data:bytes) -> int:
+    assert len(data) <= 0x100
+    self._gsp_libos_args_page = data + bytes(0x100 - len(data))
+    self.usb.write(0xBA00, self._gsp_libos_args_page)
+    return 0x828200
+
+  def stage_gsp_boot(self, data:bytes):
+    # The UT3G stream is only reliable at Gen1 with small read requests and ASPM disabled.
+    bridge_bus, endpoint_bus = self.gpu_bus - 1, self.gpu_bus
+    for bus, cap in ((bridge_bus, 0x80), (endpoint_bus, 0x78)):
+      ctl2 = self.usb.pcie_cfg_req(cap + 0x30, bus=bus, size=2)
+      self.usb.pcie_cfg_req(cap + 0x30, bus=bus, value=(ctl2 & ~0xF) | 1, size=2)
+      linkctl = self.usb.pcie_cfg_req(cap + 0x10, bus=bus, size=2)
+      self.usb.pcie_cfg_req(cap + 0x10, bus=bus, value=linkctl & ~0x3, size=2)
+    bridge_linkctl = self.usb.pcie_cfg_req(0x80 + 0x10, bus=bridge_bus, size=2)
+    self.usb.pcie_cfg_req(0x80 + 0x10, bus=bridge_bus, value=bridge_linkctl | 0x20, size=2)
+    time.sleep(0.1)
+    devctl = self.usb.pcie_cfg_req(0x78 + 0x08, bus=endpoint_bus, size=2)
+    self.usb.pcie_cfg_req(0x78 + 0x08, bus=endpoint_bus, value=devctl & ~0x7000, size=2)
+    for bus in range(endpoint_bus + 1):
+      self.usb.pcie_cfg_req(0x104, bus=bus, value=0xFFFFFFFF, size=4)
+      self.usb.pcie_cfg_req(0x110, bus=bus, value=0xFFFFFFFF, size=4)
+    self.usb.scsi_write(data)
+
+  @staticmethod
+  def _wait_until(deadline:float):
+    while time.perf_counter() < deadline: pass
+
+  def stream_gsp_boot(self, image:bytes|memoryview, launched_at:float):
+    self.usb.stream_gsp_image(image, launched_at)
+    # SEC2 still touches its system-memory aperture after the image stream. Restore once after
+    # verification, then once immediately before the GSP handoff.
+    self._wait_until(launched_at + 0.270)
+    self.usb.scsi_write(bytes(self.gsp_queues._root._mirror))
+    self._wait_until(launched_at + 0.380)
+    self.usb.scsi_write(bytes(self.gsp_queues._root._mirror))
+    self.usb.write(0xB900, self._gsp_rm_args_page)
+    self.usb.write(0xBA00, self._gsp_libos_args_page)
+
+  def arm_gsp_queue_read(self): self.gsp_queues.arm_read()
+  def sync_gsp_queue(self): self.gsp_queues.sync()
+
+  def read_config(self, offset:int, size:int): return self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, size=size)
+  def write_config(self, offset:int, value:int, size:int): self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, value=value, size=size)
+  def flush_writes(self): self.read_config(pci.PCI_VENDOR_ID, 4)
+
+  def reset(self):
+    if self.gpu_bus <= 0: raise RuntimeError(f"Cannot reset USB PCIe endpoint on bus {self.gpu_bus}: no upstream bridge")
+    self.write_config_flush(pci.PCI_COMMAND, self.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
+    bridge_bus = self.gpu_bus - 1
+    bridge_ctl = self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus, size=2)
+    self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus,
+                          value=bridge_ctl | pci.PCI_BRIDGE_CTL_BUS_RESET, size=2)
+    try: time.sleep(0.1)
+    finally:
+      self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus,
+                            value=bridge_ctl & ~pci.PCI_BRIDGE_CTL_BUS_RESET, size=2)
+    self.usb.wait_for_pcie_link()
+    # GA102 clears WPR and makes configuration space reliable about one second after hot reset deassertion.
+    time.sleep(1.0)
+    self._setup_pcie()
 
   def bar_info(self, bar_idx:int) -> tuple[int, int]: return self._bar_info[bar_idx]  # type: ignore[override]
   def map_bar(self, bar, off=0, addr=0, size=None, fmt='B'):
-    return USBMMIOInterface(self.usb, self.bar_info(bar)[0] + off, size or self.bar_info(bar)[1], fmt)
+    bar_addr, bar_size = self.bar_info(bar)
+    size = bar_size - off if size is None else size
+    if off < 0 or size < 0 or off + size > bar_size:
+      raise ValueError(f"BAR{bar} mapping [{off:#x}, {off+size:#x}) exceeds its {bar_size:#x}-byte aperture")
+    return USBMMIOInterface(self.usb, bar_addr + off, size, fmt)
   def resize_bar(self, bar_idx:int): pass # already resized
 
 @dataclasses.dataclass
@@ -261,6 +366,7 @@ class PCIIfaceBase:
     self.dev, self.vram_bar, self.count = dev, vram_bar, len(hcq_filter_visible_devices(System.list_devices(vendor, devices, base_class), dn))
 
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, **kwargs) -> HCQBuffer:
+    cpu_visible = kwargs.pop("cpu_visible", False)
     should_use_sysmem = host or ((cpu_access if self.is_bar_small() else (uncached and cpu_access)) and not force_devmem)
 
     # Align size to huge pages for large allocations, otherwise the unaligned tail falls back to 4KB pages, increasing TLB pressure.
@@ -272,7 +378,8 @@ class PCIIfaceBase:
       mapping = self.dev_impl.mm.map_range(vaddr, size, [(paddr, 0x1000) for paddr in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
       return HCQBuffer(vaddr, size, meta=PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=paddrs[0]), view=memview, owner=self.dev)
 
-    mapping = self.dev_impl.mm.valloc(size:=round_up(size, 0x1000), uncached=uncached, contiguous=cpu_access)
+    mapping = self.dev_impl.mm.valloc(size:=round_up(size, 0x1000), uncached=uncached, contiguous=contiguous or cpu_access,
+                                      cpu_visible=cpu_visible)
     barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size) if cpu_access else None
     return HCQBuffer(mapping.va_addr, size, view=barview, meta=PCIAllocationMeta(mapping, cpu_access, hMemory=mapping.paddrs[0][0]), owner=self.dev)
 
