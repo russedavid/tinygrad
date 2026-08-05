@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, time, array, struct, itertools, dataclasses
+import ctypes, time, array, struct, itertools, dataclasses, enum, hashlib
 from typing import cast, Any, Callable
 from tinygrad.runtime.autogen import nv, nv_570 as nv_gpu, pci
 from tinygrad.helpers import lo32, hi32, DEBUG, round_up, round_down, fetch_fw, wait_cond, ceildiv
@@ -42,10 +42,11 @@ class NV_IP:
   def __init__(self, nvdev): self.nvdev = nvdev
   def init_sw(self): pass # Prepare sw/allocations for this IP
   def init_hw(self): pass # Initialize hw for this IP
+  def prep_fini(self): pass # Prepare resources needed to finalize this IP
   def fini_hw(self): pass # Finalize hw for this IP
 
 class NVRpcQueue:
-  def __init__(self, gsp:NV_GSP, view:MMIOInterface, completion_q_view:MMIOInterface|None=None):
+  def __init__(self, gsp:NV_GSP, view:MMIOInterface, completion_q_view:MMIOInterface|None=None, resume:bool=False):
     self.tx_view = view.view(fmt='I')
     wait_cond(lambda: self.tx_view[getattr(nv.msgqTxHeader, 'entryOff').offset // 4], value=0x1000, msg="RPC queue not initialized")
     self.tx = nv.msgqTxHeader.from_buffer_copy(bytes(view[:ctypes.sizeof(nv.msgqTxHeader)]))
@@ -59,6 +60,22 @@ class NVRpcQueue:
     self._direct_transport = getattr(getattr(view, "_root", None), "_direct_status", False)
     self._direct_status = completion_q_view is not None and self._direct_transport
     self._direct_seen_sequences:set[int] = set()
+    if resume:
+      sequences = self._valid_sequences()
+      if completion_q_view is None: self.seq = ((max(sequences) + 1) & 0xffffffff) if sequences else 0
+      else:
+        self._direct_seen_sequences.update(sequences)
+        if self._direct_status:
+          self.rx_view[0] = self.tx_view[getattr(nv.msgqTxHeader, 'writePtr').offset // 4]
+          System.memory_barrier()
+
+  def _valid_sequences(self) -> set[int]:
+    sequences:set[int] = set()
+    for slot in range(self.tx.msgCount):
+      try: elem, _, _ = self._read_record(slot)
+      except RuntimeError: continue
+      sequences.add(elem.seqNum)
+    return sequences
 
   def _checksum(self, data:bytes):
     if (pad_len:=(-len(data)) % 8): data += b'\x00' * pad_len
@@ -174,12 +191,36 @@ class NVRpcQueue:
       if (msg:=next((message for func, message in self.read_resp() if func == cmd), None)) is not None: return msg
     raise RuntimeError(f"Timeout waiting for RPC response for command {cmd}")
 
+class NVGspLifecycleState(enum.IntEnum):
+  PREPARED = 1
+  WPR_ACTIVE = 2
+  GSP_RUNNING = 3
+  RM_READY = 4
+  ROOT_READY = 5
+  PROCESS_READY = 6
+  ROOT_RELEASED = 7
+  GSP_SUSPENDED = 8
+  FWSEC_COMPLETE = 9
+
 class NV_FLCN(NV_IP):
+  GSP_FALCON_CPUCTL = 0x00110100
+  FALCON_CPUCTL_HALTED = 1 << 4
+  LIFECYCLE_MAGIC = b"TGNVRM1\0"
+  LIFECYCLE_VERSION = 1
+  LIFECYCLE_RECORD = struct.Struct("<8s23I32s")
+  LIFECYCLE_PREFIX = struct.Struct("<8s23I")
+  LIFECYCLE_STATE = struct.Struct("<I")
+  LIFECYCLE_STATE_MAGIC = 0x4e560000
+  _lifecycle_record:tuple[MMIOInterface, int, list[int], bytes, bytes]
+
   def wait_for_reset(self):
+    wait_cond(lambda: self.nvdev.rreg(self.GSP_FALCON_CPUCTL) & self.FALCON_CPUCTL_HALTED,
+              value=self.FALCON_CPUCTL_HALTED, msg="waiting for GSP Falcon to halt after GFW boot")
     wait_cond(lambda _: self.nvdev.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK.read_bitfields()['read_protection_level0'] == 1 and
                         self.nvdev.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05[0].read() & 0xff == 0xff, "waiting for reset")
 
-  def init_sw(self):
+  def _init_regs(self):
+    self.falcon, self.sec2 = 0x00110000, 0x00840000
     self.nvdev.include("dev_gsp", "ga102")
     self.nvdev.include("dev_falcon_v4", "ga102")
     self.nvdev.include("dev_riscv_pri", "ga102")
@@ -187,6 +228,9 @@ class NV_FLCN(NV_IP):
     self.nvdev.include("dev_falcon_second_pri", "ga102")
     self.nvdev.include("dev_sec_pri", "ga102")
     self.nvdev.include("dev_bus", "tu102")
+
+  def init_sw(self):
+    self._init_regs()
 
     self.prep_ucode()
     self.prep_booter()
@@ -250,28 +294,129 @@ class NV_FLCN(NV_IP):
       patched_image[(cmd_off:=self.desc_v3.IMEMLoadSize+dmem.cmd_in_buffer_offset) : cmd_off+len(cmd)] = cmd
       patched_image[(sig_off:=self.desc_v3.IMEMLoadSize+self.desc_v3.PKCDataOffset) : sig_off+0x180] = signature[-0x180:]
 
-      return self.nvdev._alloc_boot_mem(len(patched_image), data=patched_image, sysmem=False)
+      return bytes(patched_image)
 
-    _, self.frts_image_paddr, _ = __patch(0x15, bytes(frts_cmd))
+    frts_image = __patch(0x15, bytes(frts_cmd))
+    _, self.frts_image_paddr, _ = self.nvdev._alloc_boot_mem(len(frts_image), data=frts_image, sysmem=False)
+    if getattr(self.nvdev.pci_dev, "gsp_full_teardown", False):
+      self._sb_image = __patch(0x19, bytes(read_vbios_desc))
+      self.sb_code_off, self.sb_data_off = 0, self.desc_v3.IMEMLoadSize
+      self.sb_imem_pa, self.sb_imem_va, self.sb_imem_sz = self.desc_v3.IMEMPhysBase, self.desc_v3.IMEMVirtBase, self.desc_v3.IMEMLoadSize
+      self.sb_dmem_pa, self.sb_dmem_va, self.sb_dmem_sz = self.desc_v3.DMEMPhysBase, 0, self.desc_v3.DMEMLoadSize
+      self.sb_pkc_off, self.sb_engid, self.sb_ucodeid = self.desc_v3.PKCDataOffset, self.desc_v3.EngineIdMask, self.desc_v3.UcodeId
 
   def prep_booter(self):
-    sha = {"ga102":"4497e3eff7e95c774b8a569d17b27c08c9650158d10b229d2be81cdcad9a085b",
-           "ad102":"8b293e19b637c5e22c87a2428d1c71bb13e0904e8a88ac6b3c6c1f2679c6e37a"}[self.nvdev.fw_name]
-    h = nv.struct_nvfw_bin_hdr.from_buffer_copy(b:=fetch_fw(f"nvidia/{self.nvdev.fw_name}/gsp", "booter_load-570.144.bin", sha))
-    lh = nv.struct_nvfw_hs_load_header_v2.from_buffer_copy(b, (hs:=nv.struct_nvfw_hs_header_v2.from_buffer_copy(b, h.header_offset)).header_offset)
-    app = nv.struct_nvfw_hs_load_header_v2_app.from_buffer_copy(b, hs.header_offset + ctypes.sizeof(nv.struct_nvfw_hs_load_header_v2))
+    shas = {
+      "ga102": ("4497e3eff7e95c774b8a569d17b27c08c9650158d10b229d2be81cdcad9a085b",
+                "8e63db5b78d7d3e349f20a2d11099c3d7109081393cb09ffc0a28133324ae009"),
+      "ad102": ("8b293e19b637c5e22c87a2428d1c71bb13e0904e8a88ac6b3c6c1f2679c6e37a",
+                "975b85a14ded8e430d30f000c3c1afdd55c15dee04f35ff9dfd876acd7e67186")}[self.nvdev.fw_name]
 
-    patch_loc, patch_sig = struct.unpack_from("<I", b, hs.patch_loc)[0], struct.unpack_from("<I", b, hs.patch_sig)[0]
-    sig = b[(sig_off:=hs.sig_prod_offset + patch_sig):sig_off + (sig_len:=hs.sig_prod_size // struct.unpack_from("<I", b, hs.num_sig)[0])]
+    def __prep(name:str, sha:str):
+      h = nv.struct_nvfw_bin_hdr.from_buffer_copy(b:=fetch_fw(f"nvidia/{self.nvdev.fw_name}/gsp", name, sha))
+      hs = nv.struct_nvfw_hs_header_v2.from_buffer_copy(b, h.header_offset)
+      lh = nv.struct_nvfw_hs_load_header_v2.from_buffer_copy(b, hs.header_offset)
+      app = nv.struct_nvfw_hs_load_header_v2_app.from_buffer_copy(b, hs.header_offset + ctypes.sizeof(nv.struct_nvfw_hs_load_header_v2))
+      patch_loc, patch_sig = struct.unpack_from("<I", b, hs.patch_loc)[0], struct.unpack_from("<I", b, hs.patch_sig)[0]
+      sig = b[(sig_off:=hs.sig_prod_offset + patch_sig):sig_off + (sig_len:=hs.sig_prod_size // struct.unpack_from("<I", b, hs.num_sig)[0])]
+      (patched_image:=bytearray(b[h.data_offset:h.data_offset + h.data_size]))[patch_loc:patch_loc+sig_len] = sig
+      return bytes(patched_image), lh.os_data_offset, lh.os_data_size, app.offset, app.size
 
-    (patched_image:=bytearray(b[h.data_offset:h.data_offset + h.data_size]))[patch_loc:patch_loc+sig_len] = sig
+    load_image, self.booter_data_off, self.booter_data_sz, self.booter_code_off, self.booter_code_sz = __prep("booter_load-570.144.bin", shas[0])
+    _, self.booter_image_paddr, _ = self.nvdev._alloc_boot_mem(len(load_image), data=load_image, sysmem=False)
+    if getattr(self.nvdev.pci_dev, "gsp_full_teardown", False):
+      self._booter_unload_image, self.booter_unload_data_off, self.booter_unload_data_sz, \
+        self.booter_unload_code_off, self.booter_unload_code_sz = __prep("booter_unload-570.144.bin", shas[1])
 
-    _, self.booter_image_paddr, _ = self.nvdev._alloc_boot_mem(len(patched_image), data=patched_image, sysmem=False)
-    self.booter_data_off, self.booter_data_sz, self.booter_code_off, self.booter_code_sz = lh.os_data_offset, lh.os_data_size, app.offset, app.size
+  def _lifecycle_values(self, sb_off:int, booter_off:int) -> list[int]:
+    return [self.LIFECYCLE_VERSION, 0, booter_off + len(self._booter_unload_image), self.nvdev.chip_id,
+      sb_off, len(self._sb_image), booter_off, len(self._booter_unload_image),
+      self.sb_code_off, self.sb_data_off, self.sb_imem_pa, self.sb_imem_va, self.sb_imem_sz,
+      self.sb_dmem_pa, self.sb_dmem_va, self.sb_dmem_sz, self.sb_pkc_off, self.sb_engid, self.sb_ucodeid,
+      self.booter_unload_code_off, self.booter_unload_code_sz, self.booter_unload_data_off, self.booter_unload_data_sz]
 
-  def init_hw(self):
-    self.falcon, self.sec2 = 0x00110000, 0x00840000
+  def _write_lifecycle_state(self, state:NVGspLifecycleState):
+    view = self._lifecycle_record[0]
+    off = self.LIFECYCLE_RECORD.size
+    encoded = self.LIFECYCLE_STATE.pack(self.LIFECYCLE_STATE_MAGIC | int(state))
+    view[off:off+self.LIFECYCLE_STATE.size] = encoded
+    if bytes(view[off:off+self.LIFECYCLE_STATE.size]) != encoded:
+      raise RuntimeError(f"NVIDIA teardown record state {state.name} failed readback verification")
+    self.lifecycle_record_state = state
 
+  def _store_lifecycle_record(self, state:NVGspLifecycleState):
+    view, base = self.nvdev.pci_dev.gsp_lifecycle_view()
+    sb_off = round_up(self.LIFECYCLE_RECORD.size, 0x1000)
+    booter_off = round_up(sb_off + len(self._sb_image), 0x1000)
+    values = self._lifecycle_values(sb_off, booter_off)
+    if values[2] > view.nbytes: raise RuntimeError(f"NVIDIA teardown record requires {values[2]:#x} bytes, have {view.nbytes:#x}")
+
+    state_off = self.LIFECYCLE_RECORD.size
+    view[:len(self.LIFECYCLE_MAGIC)] = bytes(len(self.LIFECYCLE_MAGIC))
+    view[state_off:state_off+self.LIFECYCLE_STATE.size] = bytes(self.LIFECYCLE_STATE.size)
+    view[sb_off:sb_off+len(self._sb_image)] = self._sb_image
+    view[booter_off:booter_off+len(self._booter_unload_image)] = self._booter_unload_image
+    prefix = self.LIFECYCLE_PREFIX.pack(self.LIFECYCLE_MAGIC, *values)
+    view[:self.LIFECYCLE_RECORD.size] = self.LIFECYCLE_RECORD.pack(
+      self.LIFECYCLE_MAGIC, *values, hashlib.sha256(prefix + self._sb_image + self._booter_unload_image).digest())
+    self._lifecycle_record = (view, base, values, self._sb_image, self._booter_unload_image)
+    self.sb_image_paddr, self.booter_unload_image_paddr = base + sb_off, base + booter_off
+    self._write_lifecycle_state(state)
+    if self.attach_lifecycle_record() is not state: raise RuntimeError("NVIDIA teardown record state changed during verification")
+
+  def attach_lifecycle_record(self) -> NVGspLifecycleState:
+    view, base = self.nvdev.pci_dev.gsp_lifecycle_view()
+    raw = bytes(view[:self.LIFECYCLE_RECORD.size])
+    magic, *packed = self.LIFECYCLE_RECORD.unpack(raw)
+    values, digest = packed[:-1], packed[-1]
+    if magic != self.LIFECYCLE_MAGIC: raise RuntimeError(f"Missing NVIDIA teardown record (magic {magic!r})")
+    if values[0] != self.LIFECYCLE_VERSION: raise RuntimeError(f"Unsupported NVIDIA teardown record version {values[0]}")
+    if values[1] != 0: raise RuntimeError("Malformed NVIDIA teardown record reserved field")
+    state_word = self.LIFECYCLE_STATE.unpack(bytes(view[self.LIFECYCLE_RECORD.size:self.LIFECYCLE_RECORD.size+self.LIFECYCLE_STATE.size]))[0]
+    if state_word & 0xffff0000 != self.LIFECYCLE_STATE_MAGIC: raise RuntimeError(f"Invalid NVIDIA teardown state word {state_word:#x}")
+    try: state = NVGspLifecycleState(state_word & 0xffff)
+    except ValueError as exc: raise RuntimeError(f"Invalid NVIDIA teardown record state {state_word & 0xffff}") from exc
+    total_size, chip_id, sb_off, sb_size, booter_off, booter_size = values[2:8]
+    if chip_id != self.nvdev.chip_id: raise RuntimeError(f"NVIDIA teardown record is for chip {chip_id:#x}, found {self.nvdev.chip_id:#x}")
+    if not (self.LIFECYCLE_RECORD.size <= sb_off <= sb_off + sb_size <= booter_off <= booter_off + booter_size == total_size <= view.nbytes):
+      raise RuntimeError("Malformed NVIDIA teardown record ranges")
+    sb_image, booter_image = bytes(view[sb_off:sb_off+sb_size]), bytes(view[booter_off:booter_off+booter_size])
+    prefix = self.LIFECYCLE_PREFIX.pack(magic, *values)
+    if hashlib.sha256(prefix + sb_image + booter_image).digest() != digest: raise RuntimeError("NVIDIA teardown record checksum mismatch")
+
+    (self.sb_code_off, self.sb_data_off, self.sb_imem_pa, self.sb_imem_va, self.sb_imem_sz,
+     self.sb_dmem_pa, self.sb_dmem_va, self.sb_dmem_sz, self.sb_pkc_off, self.sb_engid, self.sb_ucodeid,
+     self.booter_unload_code_off, self.booter_unload_code_sz, self.booter_unload_data_off,
+     self.booter_unload_data_sz) = values[8:]
+    self.sb_image_paddr, self.booter_unload_image_paddr = base + sb_off, base + booter_off
+    self._lifecycle_record = (view, base, values, sb_image, booter_image)
+    self.lifecycle_record_state = state
+    return state
+
+  def set_lifecycle_record_state(self, state:NVGspLifecycleState):
+    if not hasattr(self, "_lifecycle_record"): return
+    current = self.attach_lifecycle_record()
+    if state < current: raise RuntimeError(f"NVIDIA teardown record cannot move backward from {current.name} to {state.name}")
+    self._write_lifecycle_state(state)
+
+  def clear_lifecycle_record(self, persisted:bool=False):
+    if not hasattr(self, "_lifecycle_record") and not persisted: return
+    view = self._lifecycle_record[0] if hasattr(self, "_lifecycle_record") else self.nvdev.pci_dev.gsp_lifecycle_view()[0]
+    cleared = bytes(len(self.LIFECYCLE_MAGIC))
+    view[:len(self.LIFECYCLE_MAGIC)] = cleared
+    if bytes(view[:len(self.LIFECYCLE_MAGIC)]) != cleared: raise RuntimeError("NVIDIA teardown record clear failed readback verification")
+    if hasattr(self, "_lifecycle_record"): del self._lifecycle_record
+
+  def prep_fini(self):
+    if not getattr(self.nvdev.pci_dev, "gsp_full_teardown", False) or hasattr(self, "sb_image_paddr"): return
+    if hasattr(self.nvdev.pci_dev, "gsp_lifecycle_view"):
+      self._store_lifecycle_record(NVGspLifecycleState.PREPARED)
+      return
+    _, self.sb_image_paddr, _ = self.nvdev._alloc_boot_mem(len(self._sb_image), data=self._sb_image, sysmem=False)
+    _, self.booter_unload_image_paddr, _ = self.nvdev._alloc_boot_mem(
+      len(self._booter_unload_image), data=self._booter_unload_image, sysmem=False)
+
+  def init_wpr(self):
     if (getattr(self.nvdev.pci_dev, "gsp_sram_boot", False) and
         (stage_boot:=getattr(self.nvdev.pci_dev, "stage_gsp_boot", None)) is not None):
       stage_boot(self.nvdev.gsp._boot_sram)
@@ -281,8 +426,15 @@ class NV_FLCN(NV_IP):
       imemPa=self.desc_v3.IMEMPhysBase, imemVa=self.desc_v3.IMEMVirtBase, imemSz=self.desc_v3.IMEMLoadSize,
       dmemPa=self.desc_v3.DMEMPhysBase, dmemVa=0x0, dmemSz=self.desc_v3.DMEMLoadSize,
       pkc_off=self.desc_v3.PKCDataOffset, engid=self.desc_v3.EngineIdMask, ucodeid=self.desc_v3.UcodeId)
-    assert self.nvdev.NV_PFB_PRI_MMU_WPR2_ADDR_HI.read() != 0, "WPR2 is not initialized"
+    if (frts_error:=self.nvdev.NV_PBUS_VBIOS_SCRATCH[0x0e].read() >> 16) != 0:
+      raise RuntimeError(f"FWSEC FRTS failed with error {frts_error:#x}")
+    if self.nvdev.NV_PFB_PRI_MMU_WPR2_ADDR_HI.read_bitfields()['val'] == 0:
+      raise RuntimeError("FWSEC FRTS completed without initializing WPR2")
+    wpr2_lo = self.nvdev.NV_PFB_PRI_MMU_WPR2_ADDR_LO.read_bitfields()['val']
+    if wpr2_lo != (expected_wpr2_lo:=self.frts_offset >> self.nvdev.NV_PFB_PRI_MMU_WPR2_ADDR_LO_ALIGNMENT):
+      raise RuntimeError(f"FWSEC FRTS initialized WPR2 at {wpr2_lo:#x}, expected {expected_wpr2_lo:#x}")
 
+  def boot_gsp(self):
     self.reset(self.falcon, riscv=True)
 
     # set up the mailbox
@@ -293,12 +445,49 @@ class NV_FLCN(NV_IP):
     self.reset(self.sec2)
     mbx = self.execute_hs(self.sec2, self.booter_image_paddr, code_off=self.booter_code_off, data_off=self.booter_data_off,
       imemPa=0x0, imemVa=self.booter_code_off, imemSz=self.booter_code_sz, dmemPa=0x0, dmemVa=0x0, dmemSz=self.booter_data_sz,
-      pkc_off=0x10, engid=1, ucodeid=3, mailbox=self.nvdev.gsp.wpr_meta_sysmem)
+      pkc_off=0x10, engid=1, ucodeid=3, mailbox=self.nvdev.gsp.wpr_meta_sysmem, stream_gsp=True)
     assert mbx[0] == 0x0, f"Booter failed to execute, mailbox is {mbx[0]:08x}, {mbx[1]:08x}"
 
     self.nvdev.NV_PFALCON_FALCON_OS.with_base(self.falcon).write(0x0)
     assert self.nvdev.NV_PRISCV_RISCV_CPUCTL.with_base(self.falcon).read_bitfields()['active_stat'] == 1, "GSP Core is not active"
     self.rearm_sec2_queue()
+
+  def init_hw(self):
+    self.init_wpr()
+    self.boot_gsp()
+
+  def shutdown_fwsec(self):
+    if self.nvdev.NV_PFB_PRI_MMU_WPR2_ADDR_HI.read() == 0: return
+    required = ("sb_image_paddr", "sb_code_off", "sb_data_off", "sb_imem_pa", "sb_imem_va", "sb_imem_sz",
+                "sb_dmem_pa", "sb_dmem_va", "sb_dmem_sz", "sb_pkc_off", "sb_engid", "sb_ucodeid")
+    if (missing:=[name for name in required if not hasattr(self, name)]):
+      raise RuntimeError(f"NVIDIA FWSEC shutdown metadata is unavailable: {', '.join(missing)}")
+    self.reset(self.falcon)
+    self.execute_hs(self.falcon, self.sb_image_paddr, code_off=self.sb_code_off, data_off=self.sb_data_off,
+      imemPa=self.sb_imem_pa, imemVa=self.sb_imem_va, imemSz=self.sb_imem_sz,
+      dmemPa=self.sb_dmem_pa, dmemVa=self.sb_dmem_va, dmemSz=self.sb_dmem_sz,
+      pkc_off=self.sb_pkc_off, engid=self.sb_engid, ucodeid=self.sb_ucodeid)
+
+    if self.nvdev.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK.read_bitfields()['read_protection_level0'] != 1:
+      raise RuntimeError("FWSEC shutdown completed without lowering the GFW privilege mask")
+    if self.nvdev.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05[0].read_bitfields()['0_gfw_boot_progress'] != \
+       self.nvdev.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT_PROGRESS_COMPLETED:
+      raise RuntimeError("FWSEC shutdown completed without restoring GFW boot progress")
+    if (sb_error:=self.nvdev.NV_PBUS_VBIOS_SCRATCH[0x15].read() & 0xffff) != 0:
+      raise RuntimeError(f"FWSEC shutdown failed with error {sb_error:#x}")
+
+  def shutdown_booter(self):
+    if self.nvdev.NV_PFB_PRI_MMU_WPR2_ADDR_HI.read() == 0: return
+    required = ("booter_unload_image_paddr", "booter_unload_code_off", "booter_unload_code_sz",
+                "booter_unload_data_off", "booter_unload_data_sz")
+    if (missing:=[name for name in required if not hasattr(self, name)]):
+      raise RuntimeError(f"NVIDIA Booter Unload metadata is unavailable: {', '.join(missing)}")
+    self.reset(self.sec2)
+    mbx = self.execute_hs(self.sec2, self.booter_unload_image_paddr, code_off=self.booter_unload_code_off,
+      data_off=self.booter_unload_data_off, imemPa=0x0, imemVa=self.booter_unload_code_off, imemSz=self.booter_unload_code_sz,
+      dmemPa=0x0, dmemVa=0x0, dmemSz=self.booter_unload_data_sz, pkc_off=0x10, engid=1, ucodeid=3, mailbox=(0xff << 32) | 0xff)
+    if mbx[0] != 0: raise RuntimeError(f"Booter Unload failed with mailbox {mbx[0]:#x}, {mbx[1]:#x}")
+    if self.nvdev.NV_PFB_PRI_MMU_WPR2_ADDR_HI.read() != 0: raise RuntimeError("Booter Unload completed but WPR2 is still active")
 
   def execute_dma(self, base:int, cmd:int, dest:int, mem_off:int, src:int, size:int):
     wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).read_bitfields()['full'], value=0, msg="DMA does not progress")
@@ -317,9 +506,9 @@ class NV_FLCN(NV_IP):
 
     wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).read_bitfields()['idle'], msg="DMA does not complete")
 
-  def start_cpu(self, base:int):
+  def start_cpu(self, base:int, stream_gsp:bool=False):
     stream_boot = (getattr(self.nvdev.pci_dev, "stream_gsp_boot", None)
-                   if base == self.sec2 and getattr(self.nvdev.pci_dev, "gsp_sram_boot", False) else None)
+                   if stream_gsp and base == self.sec2 and getattr(self.nvdev.pci_dev, "gsp_sram_boot", False) else None)
     if stream_boot is not None:
       contexts = self.nvdev.NV_PFALCON_FBIF_TRANSCFG.with_base(base)
       for i in range(8): contexts[i].update(target=0, mem_type=self.nvdev.NV_PFALCON_FBIF_TRANSCFG_MEM_TYPE_PHYSICAL)
@@ -340,7 +529,8 @@ class NV_FLCN(NV_IP):
 
   def wait_cpu_halted(self, base): wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_CPUCTL.with_base(base).read_bitfields()['halted'], msg="not halted")
 
-  def execute_hs(self, base, img_paddr, code_off, data_off, imemPa, imemVa, imemSz, dmemPa, dmemVa, dmemSz, pkc_off, engid, ucodeid, mailbox=None):
+  def execute_hs(self, base, img_paddr, code_off, data_off, imemPa, imemVa, imemSz, dmemPa, dmemVa, dmemSz, pkc_off, engid, ucodeid,
+                 mailbox=None, stream_gsp=False):
     self.disable_ctx_req(base)
 
     # target=0 is FB (not in published headers)
@@ -365,7 +555,7 @@ class NV_FLCN(NV_IP):
       self.nvdev.NV_PFALCON_FALCON_MAILBOX0.with_base(base).write(lo32(mailbox))
       self.nvdev.NV_PFALCON_FALCON_MAILBOX1.with_base(base).write(hi32(mailbox))
 
-    self.start_cpu(base)
+    self.start_cpu(base, stream_gsp=stream_gsp)
     self.wait_cpu_halted(base)
 
     if mailbox is not None:
@@ -613,8 +803,8 @@ class NV_GSP(NV_IP):
     res, prom = {}, nv_gpu.NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS(entryCount=len(ctxbufs), engineType=0x1, hChanClient=client, hObject=obj)
     for i,(buf,desc) in enumerate(ctxbufs.items()):
       use_v, use_p = (desc.virt if virt is None else virt), (desc.phys if phys is None else phys)
-      x = (bufs or {}).get(buf, self.nvdev.mm.valloc(desc.size, contiguous=True,
-                                                     cpu_visible=self.nvdev.mm.cpu_visible_pa_allocator is not None)) # allocate buffers
+      x = bufs[buf] if bufs is not None and buf in bufs else self.nvdev.mm.valloc(desc.size, contiguous=True,
+        cpu_visible=self.nvdev.mm.cpu_visible_pa_allocator is not None, zero=use_p)
       prom.promoteEntry[i] = nv_gpu.NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY(bufferId=buf, gpuVirtAddr=x.va_addr if use_v else 0, bInitialize=use_p,
         gpuPhysAddr=x.paddrs[0][0] if use_p else 0, size=desc.size if use_p else 0, physAttr=0x4 if use_p else 0, bNonmapped=(use_p and not use_v))
       res[buf] = x
@@ -672,7 +862,13 @@ class NV_GSP(NV_IP):
     self.priv_root = 0xc1e00004
     self.init_golden_image()
 
-  def fini_hw(self): self.rpc_unloading_guest_driver()
+  def fini_hw(self):
+    if (getattr(self.nvdev.pci_dev, "gsp_full_teardown", False) and
+        self.nvdev.NV_PFALCON_FALCON_MAILBOX0.with_base(self.nvdev.flcn.falcon).read() & (1 << 31)): return
+    self.rpc_unloading_guest_driver()
+    if getattr(self.nvdev.pci_dev, "gsp_full_teardown", False):
+      wait_cond(lambda: bool(self.nvdev.NV_PFALCON_FALCON_MAILBOX0.with_base(self.nvdev.flcn.falcon).read() & (1 << 31)),
+                msg="GSP did not enter processor-suspended state")
 
   ### RPCs
 
@@ -714,6 +910,16 @@ class NV_GSP(NV_IP):
       phys_gr_ctx = self.promote_ctx(client, self.subdevice, hParent, {k:v for k,v in self.grctx_bufs.items() if k in [0, 1, 2]}, virt=False)
       self.promote_ctx(client, self.subdevice, hParent, {k:v for k,v in self.grctx_bufs.items() if k in [0, 1, 2]}, phys_gr_ctx, phys=False)
     return obj if hClass != nv_gpu.NV1_ROOT else client
+
+  def rpc_rm_free(self, obj:int, client:int|None=None):
+    client = client or self.priv_root
+    args = nv.rpc_free_v(params=nv.NVOS00_PARAMETERS_v03_00(hRoot=client, hObjectParent=0, hObjectOld=obj))
+    self.cmd_q.send_rpc(nv.NV_VGPU_MSG_FUNCTION_FREE, bytes(args))
+    response = self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_FREE)
+    if len(response) < ctypes.sizeof(nv.rpc_free_v):
+      raise RuntimeError(f"Short RM free response for object {obj:#x}: {len(response)} bytes")
+    if (status:=nv.rpc_free_v.from_buffer_copy(response).params.status) != 0:
+      raise RuntimeError(f"RM free failed for object {obj:#x} with status {status:#x}")
 
   def rpc_rm_control(self, hObject:int, cmd:int, params:Any, client=None, extra=None):
     if cmd == nv_gpu.NVB0CC_CTRL_CMD_POWER_REQUEST_FEATURES:

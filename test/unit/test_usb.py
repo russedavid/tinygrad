@@ -109,17 +109,70 @@ class TestCustomASM24Controller(unittest.TestCase):
 
     controller.pcie_mem_write.assert_not_called()
 
-  def test_scsi_write_arm_encodes_slot_range_and_reuses_setup(self):
+  def test_scsi_write_arms_each_bulk_transfer(self):
     controller = object.__new__(CustomASM24Controller)
     controller.usb = MagicMock()
+    payload = bytes(0x54000)
 
-    controller.scsi_write_arm(0x54000, start_slot=11)
-    controller.usb.control_write.assert_called_once_with(0xF2, value=0x2A0, index=0x150B)
+    controller.scsi_write(payload, start_slot=11)
+    controller.scsi_write(payload, start_slot=11)
 
-    controller.usb.bulk_write(bytes(0x54000))
-    controller.usb.bulk_write(bytes(0x54000))
-    self.assertEqual(controller.usb.control_write.call_count, 1)
-    self.assertEqual(controller.usb.bulk_write.call_count, 2)
+    self.assertEqual(controller.usb.control_write.call_args_list,
+                     [unittest.mock.call(0xF2, value=0x2A0, index=0x150B)] * 2)
+    self.assertEqual(controller.usb.bulk_write.call_args_list, [unittest.mock.call(payload)] * 2)
+
+  def test_sram_stream_arms_once_and_bulk_writes_each_scheduled_chunk(self):
+    controller = object.__new__(CustomASM24Controller)
+    controller.usb, controller.firmware_capabilities = MagicMock(), CustomASM24Controller.FW_CAP_SRAM_STREAM
+    controller.firmware_revision = CustomASM24Controller.FW_SRAM_STREAM_MIN_REVISION
+    ring_size = controller.GSP_RING_PAGES * 0x1000
+    batch_size = controller.GSP_STREAM_BATCH_PAGES * 0x1000
+    image = bytes(ring_size + 4 * batch_size - 17)
+
+    with patch("tinygrad.runtime.support.usb.time.perf_counter", return_value=1.0):
+      controller.stream_gsp_image(image, 0.0)
+
+    controller.usb.control_write.assert_called_once_with(0xF5, value=4, index=0x070B)
+    self.assertEqual(controller.usb.bulk_write.call_count, 4)
+    self.assertEqual([len(call.args[0]) for call in controller.usb.bulk_write.call_args_list], [batch_size] * 4)
+
+  def test_gsp_stream_falls_back_to_per_chunk_f2_without_stream_capability(self):
+    controller = object.__new__(CustomASM24Controller)
+    controller.usb, controller.firmware_capabilities, controller.firmware_revision = MagicMock(), 0, 8
+    ring_size = controller.GSP_RING_PAGES * 0x1000
+    batch_size = controller.GSP_STREAM_BATCH_PAGES * 0x1000
+
+    with patch("tinygrad.runtime.support.usb.time.perf_counter", return_value=1.0), patch.object(controller, "scsi_write") as write:
+      controller.stream_gsp_image(bytes(ring_size + 2 * batch_size), 0.0)
+
+    self.assertEqual([call.kwargs["start_slot"] for call in write.call_args_list], [11, 18])
+    controller.usb.control_write.assert_not_called()
+
+  def test_gsp_stream_falls_back_to_per_chunk_f2_before_interruptible_rearm(self):
+    controller = object.__new__(CustomASM24Controller)
+    controller.usb, controller.firmware_capabilities = MagicMock(), CustomASM24Controller.FW_CAP_SRAM_STREAM
+    controller.firmware_revision = CustomASM24Controller.FW_SRAM_STREAM_MIN_REVISION - 1
+    ring_size = controller.GSP_RING_PAGES * 0x1000
+    batch_size = controller.GSP_STREAM_BATCH_PAGES * 0x1000
+
+    with patch("tinygrad.runtime.support.usb.time.perf_counter", return_value=1.0), patch.object(controller, "scsi_write") as write:
+      controller.stream_gsp_image(bytes(ring_size + 2 * batch_size), 0.0)
+
+    self.assertEqual([call.kwargs["start_slot"] for call in write.call_args_list], [11, 18])
+    controller.usb.control_write.assert_not_called()
+
+  def test_sram_read_encodes_slot_range_without_changing_triggered_reads(self):
+    controller = object.__new__(CustomASM24Controller)
+    controller.usb = MagicMock()
+    controller.usb.bulk_read.return_value = memoryview(bytes(0x5000))
+
+    self.assertEqual(bytes(controller.sram_read(0x5000, start_slot=3)), bytes(0x5000))
+    controller.usb.control_write.assert_called_once_with(0xF2, value=0x8028, index=0x0203)
+    controller.usb.bulk_read.assert_called_once_with(0x5000, timeout=10000)
+
+    controller.usb.control_write.reset_mock()
+    controller.scsi_read(0x1000)
+    controller.usb.control_write.assert_not_called()
 
   def test_large_pcie_transfers_are_chunked(self):
     controller = object.__new__(CustomASM24Controller)
@@ -167,14 +220,21 @@ class TestUSBPCIeDiscovery(unittest.TestCase):
     self.assertEqual(iface.count, 2)
 
   @patch.object(USBPCIDevice, "_setup_pcie")
+  @patch.object(USBPCIDevice, "supports_flr", return_value=True)
   @patch("tinygrad.runtime.support.system.CustomASM24Controller")
   @patch("tinygrad.runtime.support.system.USB3")
   @patch.object(System, "flock_acquire", return_value=1)
-  def test_nvidia_device_allows_full_fixed_window_boot_drain(self, flock_acquire, usb3, controller, setup_pcie):
+  def test_nvidia_device_allows_full_fixed_window_boot_drain(self, flock_acquire, usb3, controller, supports_flr, setup_pcie):
     dev = USBPCIDevice("NV", MagicMock(), "custom v0.1")
 
     self.assertEqual(dev.gsp_rpc_timeout_ms, 120000)
+    self.assertTrue(dev.gsp_full_teardown)
+    self.assertTrue(dev.gsp_flr_recovery)
+    self.assertEqual(dev.gsp_lifecycle_size, 1 << 20)
+    self.assertTrue(dev.wpr_reset_supported)
+    self.assertFalse(hasattr(dev, "reset_after_gsp_teardown"))
     controller.assert_called_once_with(usb3.return_value, minimum_revision=3)
+    supports_flr.assert_called_once_with()
 
   def test_stops_before_writing_endpoint_bus_registers(self):
     controller = FakePCIeController()
@@ -194,6 +254,9 @@ class TestUSBPCIeDiscovery(unittest.TestCase):
 
     bus_writes = [c for c in controller.pcie_cfg_req.call_args_list if c.args[0] == pci.PCI_PRIMARY_BUS and "value" in c.kwargs]
     self.assertEqual([(c.kwargs["bus"], c.kwargs["value"]) for c in bus_writes], [(0, 0x00020100), (1, 0x00020201)])
+    endpoint_commands = [c.kwargs["value"] for c in controller.pcie_cfg_req.call_args_list
+                         if c.args[0] == pci.PCI_COMMAND and c.kwargs.get("bus") == 2 and "value" in c.kwargs]
+    self.assertEqual(endpoint_commands, [0, pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER])
 
   def test_stages_nvidia_gsp_arguments_in_fixed_xdata_window(self):
     dev = object.__new__(USBPCIDevice)
@@ -204,6 +267,14 @@ class TestUSBPCIeDiscovery(unittest.TestCase):
 
     self.assertEqual(dev.usb.write.call_args_list[0].args, (0xB900, b"RM" + bytes(0xFE)))
     self.assertEqual(dev.usb.write.call_args_list[1].args, (0xBA00, b"OS" + bytes(0xFE)))
+
+  def test_lifecycle_storage_reserves_top_of_bar1(self):
+    dev = object.__new__(USBPCIDevice)
+    dev.gsp_lifecycle_size = 1 << 20
+    dev.bar_info, dev.map_bar = MagicMock(return_value=(0x800000000, 0x10000000)), MagicMock(return_value="view")
+
+    self.assertEqual(dev.gsp_lifecycle_view(), ("view", 0x0FF00000))
+    dev.map_bar.assert_called_once_with(1, off=0x0FF00000, size=1 << 20)
 
   def test_map_bar_rejects_an_adjacent_bar_address(self):
     dev = object.__new__(USBPCIDevice)
@@ -248,6 +319,97 @@ class TestUSBPCIeDiscovery(unittest.TestCase):
     self.assertEqual(sleep.call_args_list, [unittest.mock.call(0.1), unittest.mock.call(1.0)])
     dev._setup_pcie.assert_called_once_with()
 
+  def test_discovers_flr_through_standard_capability_list(self):
+    dev = object.__new__(USBPCIDevice)
+    config = {
+      (pci.PCI_STATUS, 2): pci.PCI_STATUS_CAP_LIST,
+      (pci.PCI_CAPABILITY_LIST, 1): 0x60,
+      (0x60, 2): (0x78 << 8) | 0x01,
+      (0x78, 2): pci.PCI_CAP_ID_EXP,
+      (0x78 + pci.PCI_EXP_DEVCAP, 4): pci.PCI_EXP_DEVCAP_FLR,
+    }
+    dev.read_config = MagicMock(side_effect=lambda offset, size: config[(offset, size)])
+
+    self.assertEqual(dev._pci_capability(pci.PCI_CAP_ID_EXP), 0x78)
+    self.assertTrue(dev.supports_flr())
+
+  def test_rejects_cyclic_pci_capability_list(self):
+    dev = object.__new__(USBPCIDevice)
+    config = {
+      (pci.PCI_STATUS, 2): pci.PCI_STATUS_CAP_LIST,
+      (pci.PCI_CAPABILITY_LIST, 1): 0x60,
+      (0x60, 2): (0x60 << 8) | 0x01,
+    }
+    dev.read_config = MagicMock(side_effect=lambda offset, size: config[(offset, size)])
+
+    with self.assertRaisesRegex(RuntimeError, "Malformed PCI capability list at 0x60"):
+      dev._pci_capability(pci.PCI_CAP_ID_EXP)
+
+  def test_flr_requires_endpoint_support(self):
+    dev = object.__new__(USBPCIDevice)
+    dev._pci_capability, dev.read_config = MagicMock(return_value=None), MagicMock()
+    dev.write_config, dev.write_config_flush = MagicMock(), MagicMock()
+
+    with self.assertRaisesRegex(RuntimeError, "does not support Function Level Reset"):
+      dev.function_level_reset()
+
+    dev.read_config.assert_not_called()
+    dev.write_config.assert_not_called()
+    dev.write_config_flush.assert_not_called()
+
+  @patch("tinygrad.runtime.support.system.time.sleep")
+  def test_flr_quiesces_endpoint_and_rebuilds_pcie_state(self, sleep):
+    dev = object.__new__(USBPCIDevice)
+    cap, identity, events = 0x78, 0x220410DE, []
+    identities, transaction_status = iter((identity, 0xffffffff, identity, identity)), iter((pci.PCI_EXP_DEVSTA_TRPND, 0))
+
+    def read_config(offset, size):
+      events.append(("read", offset, size))
+      if offset == cap + pci.PCI_EXP_DEVCAP: return pci.PCI_EXP_DEVCAP_FLR
+      if offset == pci.PCI_VENDOR_ID: return next(identities)
+      if offset == pci.PCI_COMMAND: return pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER
+      if offset == cap + pci.PCI_EXP_DEVSTA: return next(transaction_status)
+      if offset == cap + pci.PCI_EXP_DEVCTL: return 0x123
+      raise AssertionError(f"unexpected config read at {offset:#x} size {size}")
+
+    dev._pci_capability = MagicMock(return_value=cap)
+    dev.read_config = MagicMock(side_effect=read_config)
+    dev.write_config_flush = MagicMock(side_effect=lambda *args: events.append(("flush", *args)))
+    dev.write_config = MagicMock(side_effect=lambda *args: events.append(("write", *args)))
+    dev._setup_pcie = MagicMock(side_effect=lambda: events.append(("setup",)))
+
+    dev.function_level_reset()
+
+    dev.write_config_flush.assert_called_once_with(
+      pci.PCI_COMMAND, pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY, 2)
+    dev.write_config.assert_called_once_with(
+      cap + pci.PCI_EXP_DEVCTL, 0x123 | pci.PCI_EXP_DEVCTL_BCR_FLR, 2)
+    self.assertEqual(sleep.call_args_list, [unittest.mock.call(0.001), unittest.mock.call(0.1), unittest.mock.call(0.01)])
+    dev._setup_pcie.assert_called_once_with()
+    self.assertLess(events.index(("write", cap + pci.PCI_EXP_DEVCTL, 0x123 | pci.PCI_EXP_DEVCTL_BCR_FLR, 2)),
+                    events.index(("setup",)))
+
+  @patch("tinygrad.runtime.support.system.time.monotonic", side_effect=(0.0, 1.0))
+  def test_flr_does_not_trigger_with_pending_transactions(self, monotonic):
+    dev = object.__new__(USBPCIDevice)
+    cap, identity = 0x78, 0x220410DE
+    config = {
+      (cap + pci.PCI_EXP_DEVCAP, 4): pci.PCI_EXP_DEVCAP_FLR,
+      (pci.PCI_VENDOR_ID, 4): identity,
+      (pci.PCI_COMMAND, 2): pci.PCI_COMMAND_MASTER,
+      (cap + pci.PCI_EXP_DEVSTA, 2): pci.PCI_EXP_DEVSTA_TRPND,
+    }
+    dev._pci_capability = MagicMock(return_value=cap)
+    dev.read_config = MagicMock(side_effect=lambda offset, size: config[(offset, size)])
+    dev.write_config, dev.write_config_flush, dev._setup_pcie = MagicMock(), MagicMock(), MagicMock()
+
+    with self.assertRaisesRegex(TimeoutError, "waiting for PCIe transactions before FLR"):
+      dev.function_level_reset(timeout=0.5)
+
+    dev.write_config_flush.assert_called_once_with(pci.PCI_COMMAND, 0, 2)
+    dev.write_config.assert_not_called()
+    dev._setup_pcie.assert_not_called()
+
 
 class TestUSBIfaceAllocation(unittest.TestCase):
   def test_usb_copy_staging_pool_is_bounded_for_small_bar1(self):
@@ -270,7 +432,7 @@ class TestUSBIfaceAllocation(unittest.TestCase):
       self.assertIs(iface.alloc(0x200000, host=True), ret)
 
     alloc.assert_called_once_with(iface, 0x200000, host=False, uncached=True, cpu_access=False,
-                                  contiguous=True, force_devmem=True, cpu_visible=True)
+                                  contiguous=True, force_devmem=True, cpu_visible=True, zero=False)
     iface.pci_dev.map_bar.assert_called_once_with(1, off=0x123000, size=0x200000)
     self.assertIs(ret.view, bar_view)
     self.assertFalse(ret.meta.has_cpu_mapping)
@@ -281,9 +443,11 @@ class TestUSBIfaceAllocation(unittest.TestCase):
     ret = MagicMock()
     ret.meta.has_cpu_mapping = True
 
-    with patch.object(PCIIfaceBase, "alloc", autospec=True, return_value=ret):
+    with patch.object(PCIIfaceBase, "alloc", autospec=True, return_value=ret) as alloc:
       self.assertIs(iface.alloc(0x1000, cpu_access=True), ret)
 
+    alloc.assert_called_once_with(iface, 0x1000, host=False, uncached=False, cpu_access=True,
+                                  contiguous=False, force_devmem=True, cpu_visible=True, zero=False)
     self.assertFalse(ret.meta.has_cpu_mapping)
 
   def test_normal_gpu_buffer_does_not_consume_cpu_visible_vram(self):
@@ -330,6 +494,5 @@ class TestASM24GSPQueueInterface(unittest.TestCase):
                      [(4, b"PTES"), (20, b"CMDH"), (19, b"CMD0")])
     xdata_writes = [write for write in self.controller.writes if write[0] == "xdata"]
     self.assertEqual(xdata_writes, [("xdata", 0xB800, b"STAH"), ("xdata", 0xA000, b"STA0"), ("xdata", 0xF000, b"STA1")])
-
 
 if __name__ == "__main__": unittest.main()

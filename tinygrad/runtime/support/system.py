@@ -115,13 +115,18 @@ class _System:
 
       usb.pcie_cfg_req(pci.PCI_COMMAND, bus=bus, dev=0, fn=0, value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=1)
 
+    endpoint_cmd = usb.pcie_cfg_req(pci.PCI_COMMAND, bus=gpu_bus, dev=0, fn=0, size=2)
+    usb.pcie_cfg_req(pci.PCI_COMMAND, bus=gpu_bus, dev=0, fn=0,
+                     value=endpoint_cmd & ~(pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER), size=2)
+
     # resize bar 0
     cap_ptr = 0x100
     while cap_ptr:
       if pci.PCI_EXT_CAP_ID(hdr:=usb.pcie_cfg_req(cap_ptr, bus=gpu_bus, dev=0, fn=0, size=4)) == pci.PCI_EXT_CAP_ID_REBAR:
         cap = usb.pcie_cfg_req(cap_ptr + 0x04, bus=gpu_bus, dev=0, fn=0, size=4)
-        new_ctrl = (usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, size=4) & ~0x1F00) | ((int(cap >> 4).bit_length() - 1) << 8)
-        usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, value=new_ctrl, size=4)
+        ctrl = usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, size=4)
+        new_ctrl = (ctrl & ~0x1F00) | ((int(cap >> 4).bit_length() - 1) << 8)
+        if new_ctrl != ctrl: usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, value=new_ctrl, size=4)
 
       cap_ptr = pci.PCI_EXT_CAP_NEXT(hdr)
 
@@ -147,7 +152,8 @@ class _System:
 
       bar_off += 8 if bar_64 else 4
 
-    usb.pcie_cfg_req(pci.PCI_COMMAND, bus=gpu_bus, dev=0, fn=0, value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=1)
+    usb.pcie_cfg_req(pci.PCI_COMMAND, bus=gpu_bus, dev=0, fn=0,
+                     value=endpoint_cmd | pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=2)
     return bars
 
   def flock_acquire(self, name:str) -> int:
@@ -237,10 +243,15 @@ class PCIDevice:
     except OSError as e: raise RuntimeError(f"Cannot resize BAR {bar_idx}: {e}. Ensure the resizable BAR option is enabled.") from e
 
 class USBPCIDevice(PCIDevice):
+  GSP_LIFECYCLE_SIZE = 1 << 20
+
   def __init__(self, devpref:str, dev, pcibus):
     self.devpref, self.pcibus, self.peer_group = devpref, pcibus, f"USBPCIDevice_{pcibus}"
     is_nv = devpref == "NV"
-    self.boot_mem_in_vram = self.skip_gsp_registry = self.gsp_sram_boot = self.verify_bar_writes = is_nv
+    self.boot_mem_in_vram = self.skip_gsp_registry = self.gsp_sram_boot = self.verify_bar_writes = self.gsp_full_teardown = is_nv
+    self.gsp_flr_recovery = False
+    self.gsp_lifecycle_size = self.GSP_LIFECYCLE_SIZE if is_nv else 0
+    self.wpr_reset_supported = not is_nv
     self.gsp_queue_size = 0x5000 if is_nv else None
     # Initial GA102 boot drains hundreds of fixed-window NOCAT records before CPU-sequencer/INIT_DONE.
     self.gsp_rpc_timeout_ms = 120000 if is_nv else None
@@ -249,6 +260,7 @@ class USBPCIDevice(PCIDevice):
     if DEBUG >= 1: print(f"{devpref.lower()} {self.pcibus}: product string: {usb.product!r}")
     self.usb: CustomASM24Controller = CustomASM24Controller(usb, minimum_revision=3 if devpref == "NV" else None)
     self._setup_pcie()
+    if is_nv: self.gsp_flr_recovery = self.wpr_reset_supported = self.supports_flr()
     self.sram = BumpAllocator(size=0x80000, wrap=False) # asm24 controller sram
 
   def _setup_pcie(self):
@@ -267,6 +279,13 @@ class USBPCIDevice(PCIDevice):
   def alloc_gsp_queues(self, size:int) -> tuple[MMIOInterface, list[int]]:
     self.gsp_queues = ASM24GSPQueueInterface(self.usb, size)
     return self.gsp_queues, self.gsp_queues.paddrs()
+
+  def gsp_lifecycle_view(self) -> tuple[MMIOInterface, int]:
+    if self.gsp_lifecycle_size <= 0: raise RuntimeError("NVIDIA GSP lifecycle storage is unavailable")
+    bar_size = self.bar_info(1)[1]
+    if self.gsp_lifecycle_size > bar_size: raise RuntimeError("NVIDIA GSP lifecycle storage exceeds BAR1")
+    base = bar_size - self.gsp_lifecycle_size
+    return self.map_bar(1, off=base, size=self.gsp_lifecycle_size), base
 
   def stage_gsp_args(self, data:bytes, offset:int) -> int:
     assert len(data) <= 0x100
@@ -309,6 +328,53 @@ class USBPCIDevice(PCIDevice):
   def write_config(self, offset:int, value:int, size:int): self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, value=value, size=size)
   def flush_writes(self): self.read_config(pci.PCI_VENDOR_ID, 4)
 
+  def _pci_capability(self, cap_id:int) -> int|None:
+    if not self.read_config(pci.PCI_STATUS, 2) & pci.PCI_STATUS_CAP_LIST: return None
+    cap, seen = self.read_config(pci.PCI_CAPABILITY_LIST, 1) & ~0x3, set()
+    while cap:
+      if cap < 0x40 or cap > 0xfc or cap in seen: raise RuntimeError(f"Malformed PCI capability list at {cap:#x}")
+      seen.add(cap)
+      header = self.read_config(cap, 2)
+      if header & 0xff == cap_id: return cap
+      cap = (header >> 8) & ~0x3
+    return None
+
+  def supports_flr(self) -> bool:
+    return (cap:=self._pci_capability(pci.PCI_CAP_ID_EXP)) is not None and \
+      bool(self.read_config(cap + pci.PCI_EXP_DEVCAP, 4) & pci.PCI_EXP_DEVCAP_FLR)
+
+  def function_level_reset(self, timeout:float=5.0) -> None:
+    cap = self._pci_capability(pci.PCI_CAP_ID_EXP)
+    if cap is None or not self.read_config(cap + pci.PCI_EXP_DEVCAP, 4) & pci.PCI_EXP_DEVCAP_FLR:
+      raise RuntimeError("PCIe endpoint does not support Function Level Reset")
+    identity = self.read_config(pci.PCI_VENDOR_ID, 4)
+    if identity in (0, 0xffffffff): raise RuntimeError(f"Cannot reset invalid PCIe identity {identity:#010x}")
+
+    command = self.read_config(pci.PCI_COMMAND, 2)
+    self.write_config_flush(pci.PCI_COMMAND, command & ~pci.PCI_COMMAND_MASTER, 2)
+    deadline = time.monotonic() + timeout
+    while self.read_config(cap + pci.PCI_EXP_DEVSTA, 2) & pci.PCI_EXP_DEVSTA_TRPND:
+      if time.monotonic() >= deadline: raise TimeoutError("Timed out waiting for PCIe transactions before FLR")
+      time.sleep(0.001)
+
+    devctl = self.read_config(cap + pci.PCI_EXP_DEVCTL, 2)
+    self.write_config(cap + pci.PCI_EXP_DEVCTL, devctl | pci.PCI_EXP_DEVCTL_BCR_FLR, 2)
+    time.sleep(0.1)
+
+    deadline = time.monotonic() + timeout
+    while True:
+      try: current_identity = self.read_config(pci.PCI_VENDOR_ID, 4)
+      except RuntimeError: current_identity = 0xffffffff
+      if current_identity == identity: break
+      if current_identity not in (0, 0xffffffff):
+        raise RuntimeError(f"PCIe identity changed across FLR from {identity:#010x} to {current_identity:#010x}")
+      if time.monotonic() >= deadline: raise TimeoutError("Timed out waiting for PCIe endpoint after FLR")
+      time.sleep(0.01)
+
+    self._setup_pcie()
+    if (current_identity:=self.read_config(pci.PCI_VENDOR_ID, 4)) != identity:
+      raise RuntimeError(f"PCIe identity changed during FLR setup from {identity:#010x} to {current_identity:#010x}")
+
   def reset(self):
     if self.gpu_bus <= 0: raise RuntimeError(f"Cannot reset USB PCIe endpoint on bus {self.gpu_bus}: no upstream bridge")
     self.write_config_flush(pci.PCI_COMMAND, self.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
@@ -321,7 +387,7 @@ class USBPCIDevice(PCIDevice):
       self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus,
                             value=bridge_ctl & ~pci.PCI_BRIDGE_CTL_BUS_RESET, size=2)
     self.usb.wait_for_pcie_link()
-    # GA102 clears WPR and makes configuration space reliable about one second after hot reset deassertion.
+    # GA102 configuration space is reliable about one second after hot reset deassertion.
     time.sleep(1.0)
     self._setup_pcie()
 
@@ -353,6 +419,7 @@ class PCIIfaceBase:
 
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, **kwargs) -> HCQBuffer:
     cpu_visible = kwargs.pop("cpu_visible", False)
+    zero = kwargs.pop("zero", True)
     should_use_sysmem = host or ((cpu_access if self.is_bar_small() else (uncached and cpu_access)) and not force_devmem)
 
     # Align size to huge pages for large allocations, otherwise the unaligned tail falls back to 4KB pages, increasing TLB pressure.
@@ -365,7 +432,7 @@ class PCIIfaceBase:
       return HCQBuffer(vaddr, size, meta=PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=paddrs[0]), view=memview, owner=self.dev)
 
     mapping = self.dev_impl.mm.valloc(size:=round_up(size, 0x1000), uncached=uncached, contiguous=contiguous or cpu_access,
-                                      cpu_visible=cpu_visible)
+                                      cpu_visible=cpu_visible, zero=zero)
     barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size) if cpu_access else None
     return HCQBuffer(mapping.va_addr, size, view=barview, meta=PCIAllocationMeta(mapping, cpu_access, hMemory=mapping.paddrs[0][0]), owner=self.dev)
 

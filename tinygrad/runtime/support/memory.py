@@ -173,7 +173,8 @@ class MemoryManager:
   va_allocator: ClassVar[TLSFAllocator|None] = None
 
   def __init__(self, dev, vram_size:int, boot_size:int, pt_t, va_bits:int, va_shifts:list[int], va_base:int,
-               palloc_ranges:list[tuple[int, int]], first_lv:int=0, reserve_ptable=False, cpu_visible_limit:int|None=None):
+               palloc_ranges:list[tuple[int, int]], first_lv:int=0, reserve_ptable=False, cpu_visible_limit:int|None=None,
+               pa_start:int|None=None):
     self.dev, self.vram_size, self.va_shifts, self.va_base, lvl_msb = dev, vram_size, va_shifts, va_base, va_shifts + [va_bits + 1]
     self.pte_covers, self.pte_cnt = [1 << x for x in va_shifts][::-1], [1 << (lvl_msb[i+1] - lvl_msb[i]) for i in range(len(lvl_msb) - 1)][::-1]
     self.pt_t, self.palloc_ranges, self.level_cnt, self.va_bits, self.reserve_ptable = pt_t, palloc_ranges, len(va_shifts), va_bits, reserve_ptable
@@ -184,7 +185,9 @@ class MemoryManager:
     if cpu_visible_limit is not None and not off_sz <= cpu_visible_limit <= vram_size:
       raise ValueError(f"CPU-visible VRAM limit {cpu_visible_limit:#x} does not contain reserved range ending at {off_sz:#x}")
     self.cpu_visible_pa_allocator = TLSFAllocator(cpu_visible_limit - off_sz, base=off_sz) if cpu_visible_limit is not None else None
-    pa_base = cpu_visible_limit if cpu_visible_limit is not None else off_sz
+    pa_base = pa_start if pa_start is not None else (cpu_visible_limit if cpu_visible_limit is not None else off_sz)
+    if not (cpu_visible_limit if cpu_visible_limit is not None else off_sz) <= pa_base <= vram_size:
+      raise ValueError(f"Physical VRAM start {pa_base:#x} overlaps an earlier allocator or exceeds VRAM size {vram_size:#x}")
     self.pa_allocator = TLSFAllocator(vram_size - pa_base, base=pa_base)
     self.root_page_table = pt_t(self.dev, self.palloc(0x1000, zero=not self.dev.smi_dev, boot=True), lv=first_lv)
 
@@ -213,9 +216,11 @@ class MemoryManager:
     ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, create_pts=True, boot=boot)
     for paddr, psize in paddrs:
       for off, pt, pte_idx, pte_cnt, pte_covers in ctx.next(psize, paddr=paddr):
-        for pte_off in range(pte_cnt):
-          pt.set_entry(pte_idx + pte_off, paddr + off + pte_off * pte_covers, uncached=uncached, aspace=aspace, snooped=snooped,
-                       frag=self._frag_size(ctx.vaddr+off, pte_cnt * pte_covers), valid=True)
+        entry_paddrs = [paddr + off + pte_off * pte_covers for pte_off in range(pte_cnt)]
+        args = dict(uncached=uncached, aspace=aspace, snooped=snooped, frag=self._frag_size(ctx.vaddr+off, pte_cnt * pte_covers), valid=True)
+        if (set_entries:=getattr(pt, "set_entries", None)) is not None: set_entries(pte_idx, entry_paddrs, **args)
+        else:
+          for pte_off, entry_paddr in enumerate(entry_paddrs): pt.set_entry(pte_idx + pte_off, entry_paddr, **args)
 
     self.on_range_mapped()
     return VirtMapping(vaddr, size, paddrs, aspace=aspace, uncached=uncached, snooped=snooped)
@@ -241,7 +246,7 @@ class MemoryManager:
     self.map_range(va:=self.alloc_vaddr(self.vram_size, self.vram_size), self.vram_size, [(0, self.vram_size)], AddrSpace.PHYS, uncached=uncached)
     return va
 
-  def valloc(self, size:int, align=0x1000, uncached=False, contiguous=False, cpu_visible=False) -> VirtMapping:
+  def valloc(self, size:int, align=0x1000, uncached=False, contiguous=False, cpu_visible=False, zero=True) -> VirtMapping:
     if not getenv("GMMU", 1):
       paddr = self.palloc(size:=round_up(size, 0x1000), align, zero=False, cpu_visible=cpu_visible)
       return VirtMapping(self.identity_va(uncached) + paddr, size, [(paddr, size)], aspace=AddrSpace.PHYS, uncached=uncached)
@@ -249,7 +254,7 @@ class MemoryManager:
     # Alloc physical memory and map it to the virtual address
     va = self.alloc_vaddr(size:=round_up(size, 0x1000), align)
 
-    if contiguous: paddrs = [(self.palloc(size, zero=True, cpu_visible=cpu_visible), size)]
+    if contiguous: paddrs = [(self.palloc(size, zero=zero, cpu_visible=cpu_visible), size)]
     else:
       # Traverse the PT to find the largest contiguous sizes we need to allocate. Try to allocate the longest segment to reduce TLB pressure.
       nxt_range, rem_size, paddrs = 0, size, []

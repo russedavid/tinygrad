@@ -12,7 +12,7 @@ from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa
 from tinygrad.runtime.support.elf import elf_loader
-from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager
+from tinygrad.runtime.support.nv.nvdev import NVDev, NVLifecyclePhase, NVLifecycleState, NVMemoryManager
 from tinygrad.runtime.support.system import System, PCIIfaceBase, USBPCIDevice, MAP_FIXED
 from tinygrad.runtime.support.usb import USB3
 from tinygrad.renderer.nir import NAKRenderer
@@ -113,6 +113,7 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
     self._q = hw_view
 
   def _submit_to_gpfifo(self, dev:NVDevice, gpfifo:GPFifo):
+    dev._set_perf_boost(True)
     if dev == self.binded_device: cmdq_addr = self.hw_page.va_addr
     else:
       cmdq_addr = dev.cmdq_allocator.alloc(len(self._q) * 4, 16)
@@ -352,6 +353,10 @@ class NVProgram(HCQProgram['NVDevice']):
 class NVAllocator(HCQAllocator['NVDevice']):
   def __init__(self, dev): super().__init__(dev, batch_cnt=getattr(dev.iface, "copy_batch_cnt", 32))
 
+  def _copyout(self, dest:memoryview, src:HCQBuffer):
+    super()._copyout(dest, src)
+    if getattr(self.dev.iface, "low_power_idle", False): self.dev._set_perf_boost(False)
+
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:
     return self.dev.iface.alloc(size, cpu_access=options.cpu_access, host=options.host)
 
@@ -571,14 +576,28 @@ class PCIIface(PCIIfaceBase):
     # PCIIface's MAP_FIXED mmap will overwrite UVM allocations made by NVKIface, so don't try PCIIface if kernel driver was already used.
     if NVKIface.root is not None: raise RuntimeError("Cannot use PCIIface after NVKIface has been initialized (would corrupt UVM memory)")
     super().__init__(dev, dev_id, vendor=0x10de, devices=((0xff00, (0x2200,0x2400,0x2500,0x2600,0x2700,0x2800,0x2b00,0x2c00,0x2d00,0x2f00)),),
-      base_class=0x03, vram_bar=1, va_start=NVMemoryManager.va_allocator.base, va_size=NVMemoryManager.va_allocator.size, dev_impl_t=NVDev)
+      base_class=0x03, vram_bar=1, va_start=NVMemoryManager.va_allocator.base, va_size=NVMemoryManager.va_allocator.size,
+      dev_impl_t=functools.partial(NVDev, initialize=False))
 
-    self._init_nvd()
+    self._init_nvd_or_cleanup()
+
+  def _init_nvd_or_cleanup(self):
+    try:
+      self.dev_impl.initialize()
+      self._init_nvd()
+    except Exception as init_error:
+      # Unclean recovery already performs its one bounded FLR attempt. Do not retry it through fini().
+      if self.dev_impl.lifecycle_phase is NVLifecyclePhase.UNCLEAN_RECOVERY: raise
+      try: self.dev_impl.fini(getattr(self, "root", None))
+      except Exception as cleanup_error:
+        raise ExceptionGroup("NVIDIA interface initialization and lifecycle cleanup both failed", [init_error, cleanup_error]) from init_error
+      raise
 
   def _init_nvd(self):
 
     self.root, self.gpu_instance = 0xc1000000, 0
     self.rm_alloc(0, nv_gpu.NV01_ROOT, nv_gpu.NV0000_ALLOC_PARAMETERS())
+    if getattr(self.pci_dev, "gsp_full_teardown", False): self.dev_impl.mark_root_ready()
 
     # Setup classes for the GPU
     self.gpfifo_class, self.compute_class, self.dma_class = (gsp:=self.dev_impl.gsp).gpfifo_class, gsp.compute_class, gsp.dma_class
@@ -591,7 +610,7 @@ class PCIIface(PCIIfaceBase):
   def rm_alloc(self, parent, clss, params=None, root=None) -> int: return self.dev_impl.gsp.rpc_rm_alloc(parent, clss, params, self.root)
   def rm_control(self, obj, cmd, params=None, **kwargs): return self.dev_impl.gsp.rpc_rm_control(obj, cmd, params, self.root, **kwargs)
 
-  def device_fini(self): self.dev_impl.fini()
+  def device_fini(self): self.dev_impl.fini(getattr(self, "root", None))
 
   def sleep(self, timeout):
     for _ in self.dev_impl.gsp.stat_q.read_resp(): pass
@@ -599,7 +618,7 @@ class PCIIface(PCIIfaceBase):
 
 class USBIface(PCIIface):
   # The fixed 256 MiB BAR1 also contains boot and kernel-argument allocations; triple buffering fits the remaining aperture.
-  copy_batch_cnt = 3
+  copy_batch_cnt, low_power_idle = 3, True
 
   def __init__(self, dev, dev_id): # pylint: disable=super-init-not-called
     if NVKIface.root is not None: raise RuntimeError("Cannot use USBIface after NVKIface has been initialized (would corrupt UVM memory)")
@@ -607,8 +626,8 @@ class USBIface(PCIIface):
     if dev_id >= len(visible:=hcq_filter_visible_devices(usb_devices, "NV")):
       raise RuntimeError(f"NV:{dev_id} does not exist ({pluralize('device', len(visible))} available)")
     self.dev, self.pci_dev, self.vram_bar, self.count = dev, USBPCIDevice("NV", *visible[dev_id]), 1, len(visible)
-    self.dev_impl = NVDev(self.pci_dev)
-    self._init_nvd()
+    self.dev_impl = NVDev(self.pci_dev, initialize=False)
+    self._init_nvd_or_cleanup()
 
   def setup_usermode(self):
     # UVM submits Ampere and Ada channels through the engine's internal runlist doorbell. The virtual-function doorbell is used on Hopper+.
@@ -631,6 +650,7 @@ class USBIface(PCIIface):
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, **kwargs) -> HCQBuffer:
     # USB has no host-memory aperture, so keep host buffers in VRAM and expose them through BAR1.
     # Host staging buffers are reused after CPU BAR writes, so their GPU mappings must bypass stale L2 data.
+    if host or cpu_access: kwargs.setdefault("zero", False)
     ret = super().alloc(size, host=False, uncached=uncached or host, cpu_access=cpu_access,
                         contiguous=contiguous or host, force_devmem=True,
                         cpu_visible=host or cpu_access,
@@ -649,8 +669,27 @@ class NVDevice(HCQCompiled[NVSignal]):
   def is_nvd(self) -> bool: return isinstance(self.iface, PCIIface)
 
   def __init__(self, device:str=""):
+    self._requested_device = device
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
     self.iface = self._select_iface()
+    self._perf_boosted, self._finalized = False, False
+
+    try:
+      if isinstance(self.iface, PCIIface) and getattr(self.iface.pci_dev, "gsp_full_teardown", False):
+        self.iface.dev_impl._run_phase(NVLifecyclePhase.PROCESS_SETUP, NVLifecycleState.PROCESS_READY, self._init_usb_device)
+      else: self._init_device()
+    except Exception as init_error:
+      try:
+        if hasattr(self.iface, "device_fini"): self.iface.device_fini()
+      except Exception as cleanup_error:
+        raise ExceptionGroup("NVIDIA device initialization and lifecycle cleanup both failed", [init_error, cleanup_error]) from init_error
+      raise
+
+  def _init_usb_device(self):
+    self._init_device()
+    self.iface.dev_impl.mark_process_ready()
+
+  def _init_device(self):
 
     device_params = nv_gpu.NV0080_ALLOC_PARAMETERS(deviceId=self.iface.gpu_instance, hClientShare=self.iface.root,
                                                    vaMode=nv_gpu.NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES)
@@ -659,9 +698,7 @@ class NVDevice(HCQCompiled[NVSignal]):
     self.virtmem = self.iface.rm_alloc(self.nvdevice, nv_gpu.NV01_MEMORY_VIRTUAL, nv_gpu.NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS(limit=0x1ffffffffffff))
     self.usermode, self.gpu_mmio = self.iface.setup_usermode()
 
-    self.iface.rm_control(self.subdevice, nv_gpu.NV2080_CTRL_CMD_PERF_BOOST, nv_gpu.NV2080_CTRL_PERF_BOOST_PARAMS(duration=0xffffffff,
-      flags=((nv_gpu.NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_YES << 4) | (nv_gpu.NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_PRIORITY_HIGH << 6) | \
-             (nv_gpu.NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX))))
+    self._set_perf_boost(True)
 
     vaspace_params = nv_gpu.NV_VASPACE_ALLOCATION_PARAMETERS(vaBase=0x1000, vaSize=0x1fffffb000000,
       flags=nv_gpu.NV_VASPACE_ALLOCATION_FLAGS_ENABLE_PAGE_FAULTING | nv_gpu.NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED)
@@ -693,13 +730,30 @@ class NVDevice(HCQCompiled[NVSignal]):
     self.arch: str = "sm_120" if self.sm_version==0xa04 else f"sm_{(self.sm_version>>8)&0xff}{(val>>4) if (val:=self.sm_version&0xff) > 0xf else val}"
     self.sass_version = ((self.sm_version & 0xf00) >> 4) | (self.sm_version & 0xf)
 
-    super().__init__(device, NVAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer, NAKRenderer], NVProgram, NVSignal, NVComputeQueue,
-                     NVCopyQueue, arch=self.arch)
+    super().__init__(self._requested_device, NVAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer, NAKRenderer],
+                     NVProgram, NVSignal, NVComputeQueue, NVCopyQueue, arch=self.arch)
 
     self.pma_enabled = PMA.value > 0 and PROFILE >= 1
     if self.pma_enabled: self._prof_init()
 
     self._setup_gpfifos()
+
+  def _set_perf_boost(self, enabled:bool):
+    if self._perf_boosted == enabled: return
+    command = nv_gpu.NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX if enabled else nv_gpu.NV2080_CTRL_PERF_BOOST_FLAGS_CMD_CLEAR
+    flags = (nv_gpu.NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_YES << 4) | (nv_gpu.NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_PRIORITY_HIGH << 6) | command
+    duration = nv_gpu.NV2080_CTRL_PERF_BOOST_DURATION_INFINITE if enabled else 0
+    self.iface.rm_control(self.subdevice, nv_gpu.NV2080_CTRL_CMD_PERF_BOOST, nv_gpu.NV2080_CTRL_PERF_BOOST_PARAMS(flags=flags, duration=duration))
+    self._perf_boosted = enabled
+
+  def synchronize(self, timeout:int|None=None):
+    super().synchronize(timeout)
+    if getattr(self.iface, "low_power_idle", False): self._set_perf_boost(False)
+
+  def finalize(self):
+    if self._finalized: return
+    super().finalize()
+    self._finalized = True
 
   def _new_gpu_fifo(self, gpfifo_area, ctxshare, channel_group, offset=0, entries=0x400, compute=False, video=False) -> GPFifo:
     notifier = self.iface.alloc(48 << 20, uncached=True)

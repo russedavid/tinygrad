@@ -2,10 +2,42 @@ import ctypes, types, unittest
 from unittest.mock import MagicMock
 
 from tinygrad.runtime.autogen import nv
-from tinygrad.runtime.support.nv.ip import NV_GSP
+from tinygrad.runtime.support.nv.ip import GRBufDesc, NV_GSP
 
 
 class TestNVGSPArguments(unittest.TestCase):
+  @staticmethod
+  def make_context_gsp():
+    gsp = object.__new__(NV_GSP)
+    gsp.nvdev = types.SimpleNamespace(mm=types.SimpleNamespace(cpu_visible_pa_allocator=None, valloc=MagicMock()))
+    gsp.rpc_rm_control = MagicMock()
+    return gsp
+
+  def test_promote_ctx_only_zeros_physical_initialization_buffers(self):
+    gsp = self.make_context_gsp()
+    physical = types.SimpleNamespace(va_addr=0x100000, paddrs=[(0x200000, 0x3000)])
+    virtual = types.SimpleNamespace(va_addr=0x300000, paddrs=[(0x400000, 0x5000)])
+    gsp.nvdev.mm.valloc.side_effect = [physical, virtual]
+
+    result = gsp.promote_ctx(1, 2, 3, {0: GRBufDesc(0x3000, virt=True, phys=True), 5: GRBufDesc(0x5000, virt=True, phys=False)})
+
+    self.assertEqual(result, {0: physical, 5: virtual})
+    self.assertEqual(gsp.nvdev.mm.valloc.call_args_list, [
+      unittest.mock.call(0x3000, contiguous=True, cpu_visible=False, zero=True),
+      unittest.mock.call(0x5000, contiguous=True, cpu_visible=False, zero=False)])
+    entries = gsp.rpc_rm_control.call_args.kwargs["params"].promoteEntry
+    self.assertEqual((entries[0].bInitialize, entries[0].gpuPhysAddr), (1, 0x200000))
+    self.assertEqual((entries[1].bInitialize, entries[1].gpuPhysAddr), (0, 0))
+
+  def test_promote_ctx_reuses_supplied_buffers_without_allocating(self):
+    gsp = self.make_context_gsp()
+    existing = types.SimpleNamespace(va_addr=0x100000, paddrs=[(0x200000, 0x3000)])
+
+    result = gsp.promote_ctx(1, 2, 3, {0: GRBufDesc(0x3000, virt=True, phys=True)}, bufs={0: existing}, phys=False)
+
+    self.assertEqual(result, {0: existing})
+    gsp.nvdev.mm.valloc.assert_not_called()
+
   def test_rpc_memory_invalidate_waits_for_completion(self):
     gsp = object.__new__(NV_GSP)
     reg = MagicMock()

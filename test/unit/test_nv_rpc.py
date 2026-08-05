@@ -2,6 +2,7 @@ import ctypes, types, unittest
 from unittest.mock import MagicMock
 
 from tinygrad.runtime.autogen import nv
+from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support.nv.ip import NVRpcQueue
 
 
@@ -36,6 +37,26 @@ class TestNVRpcQueueRecords(unittest.TestCase):
     self.assertEqual(elem.elemCount, 2)
     self.assertEqual(hdr.function, 0x1234)
     self.assertEqual(raw[ctypes.sizeof(nv.GSP_MSG_QUEUE_ELEMENT) + ctypes.sizeof(nv.rpc_message_header_v):], payload)
+
+  def test_recovers_existing_sequence_numbers(self):
+    self.write_record(0, self.make_record(4, 0x100, b"old"))
+    self.write_record(2, self.make_record(9, 0x101, b"new"))
+
+    self.assertEqual(self.queue._valid_sequences(), {4, 9})
+
+  def test_resume_starts_command_sequence_after_existing_records(self):
+    storage = (ctypes.c_ubyte * 0x5000)()
+    view = MMIOInterface(ctypes.addressof(storage), len(storage))
+    view[:ctypes.sizeof(nv.msgqTxHeader)] = bytes(nv.msgqTxHeader(
+      size=0x5000, entryOff=0x1000, msgSize=0x1000, msgCount=4, writePtr=3, flags=1,
+      rxHdrOff=ctypes.sizeof(nv.msgqTxHeader)))
+    for slot, sequence in ((0, 4), (2, 9)):
+      raw = self.make_record(sequence, 0x100 + slot, b"record")
+      view[0x1000 + slot*0x1000:0x1000 + slot*0x1000 + len(raw)] = raw
+
+    queue = NVRpcQueue(types.SimpleNamespace(), view, resume=True)
+
+    self.assertEqual(queue.seq, 10)
 
   def test_read_resp_returns_exact_payload_and_advances_by_element_count(self):
     payload = bytes((x & 0xFF) for x in range(0x1000))

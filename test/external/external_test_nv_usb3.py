@@ -20,6 +20,10 @@ class TestNVUSB3(unittest.TestCase):
     if not isinstance(cls.dev.iface, USBIface): raise unittest.SkipTest("run with DEV=USB+NV:NAK")
     cls.iface = cls.dev.iface
 
+  @classmethod
+  def tearDownClass(cls):
+    cls.dev.finalize()
+
   def test_device_and_firmware_identity(self):
     raw_usb, controller = self.iface.pci_dev.usb.usb, self.iface.pci_dev.usb
     usb_dev = libusb.libusb_get_device(raw_usb.handle)
@@ -29,7 +33,7 @@ class TestNVUSB3(unittest.TestCase):
     self.assertEqual(libusb.libusb_get_device_speed(usb_dev), libusb.LIBUSB_SPEED_SUPER)
     self.assertEqual(self.iface.pci_dev.read_config(pci.PCI_VENDOR_ID, 4), RTX_3090_PCI_ID)
     self.assertEqual(controller.firmware_protocol, (1, 0))
-    self.assertGreaterEqual(controller.firmware_revision, 3)
+    self.assertGreaterEqual(controller.firmware_revision, CustomASM24Controller.FW_SRAM_STREAM_MIN_REVISION)
     self.assertEqual(controller.firmware_capabilities & CustomASM24Controller.FW_REQUIRED_CAPABILITIES,
                      CustomASM24Controller.FW_REQUIRED_CAPABILITIES)
 
@@ -38,6 +42,16 @@ class TestNVUSB3(unittest.TestCase):
     source = np.arange((4 << 20) // 4, dtype=np.uint32) ^ np.uint32(0xA5A55A5A)
     result = Tensor(source, device="NV").contiguous().realize().numpy()
     np.testing.assert_array_equal(result, source)
+
+  def test_low_power_idle_resumes_for_compute(self):
+    self.dev.synchronize()
+    self.assertFalse(self.dev._perf_boosted)
+    result = (Tensor([2., 4.], device="NV") * 3).realize()
+    self.assertTrue(self.dev._perf_boosted)
+    self.dev.synchronize()
+    self.assertFalse(self.dev._perf_boosted)
+    self.assertEqual(result.tolist(), [6., 12.])
+    self.assertFalse(self.dev._perf_boosted)
 
   def test_channel_and_aer_health(self):
     self.dev.synchronize()

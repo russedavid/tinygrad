@@ -94,6 +94,8 @@ class CustomASM24Controller:
   FW_INFO_STRUCT, FW_PROTOCOL_MAJOR = struct.Struct("<4sBBHII"), 1
   FW_CAP_XDATA, FW_CAP_PCIE_TLP, FW_CAP_SRAM_DMA = 1 << 0, 1 << 1, 1 << 2
   FW_CAP_PCIE_POWER, FW_CAP_PCIE_POWER_POST_TRAIN, FW_CAP_USB3_DIRECT = 1 << 3, 1 << 4, 1 << 6
+  FW_CAP_SRAM_STREAM = 1 << 7
+  FW_SRAM_STREAM_MIN_REVISION = 8
   FW_REQUIRED_CAPABILITIES = FW_CAP_XDATA | FW_CAP_PCIE_TLP | FW_CAP_SRAM_DMA | FW_CAP_PCIE_POWER | FW_CAP_PCIE_POWER_POST_TRAIN | FW_CAP_USB3_DIRECT
 
   def __init__(self, usb:USB3, minimum_revision:int|None=None):
@@ -212,7 +214,7 @@ class CustomASM24Controller:
     for off, val in enumerate(data): self.usb.control_write(0xE5, value=base_addr + off, index=val)
 
   def scsi_write_arm(self, size:int, start_slot:int=0):
-    """Arm repeated bulk OUT transfers to an SRAM slot range."""
+    """Arm one bulk OUT transfer to an SRAM slot range."""
     padded_size = round_up(size, 512)
     sectors, num_slots = padded_size // 512, ceildiv(padded_size, 0x4000)
     assert 0 < sectors < 0x8000, f"invalid F2 sector count {sectors:#x}"
@@ -227,6 +229,13 @@ class CustomASM24Controller:
     self.scsi_write_arm(len(buf_padded), start_slot)
     self.usb.bulk_write(buf_padded)
 
+  def sram_stream_start(self, count:int, size:int, start_slot:int):
+    """Arm equal whole-slot SRAM writes; firmware rotates the destination after each bulk completion."""
+    assert 0 < count < 1 << 16 and size % 0x4000 == 0
+    num_slots = size // 0x4000
+    assert 0 < num_slots < 0x100 and 0 <= start_slot < 32 and start_slot + num_slots <= 32
+    self.usb.control_write(0xF5, value=count, index=start_slot | (num_slots << 8))
+
   @classmethod
   def gsp_stream_chunks(cls, image:bytes|memoryview):
     ring_size, batch_size = cls.GSP_RING_PAGES * 0x1000, cls.GSP_STREAM_BATCH_PAGES * 0x1000
@@ -238,14 +247,29 @@ class CustomASM24Controller:
 
   def stream_gsp_image(self, image:bytes|memoryview, launched_at:float):
     """Keep the SEC2-visible SRAM ring populated while it verifies the GSP image."""
-    for delay, start_slot, payload in self.gsp_stream_chunks(image):
+    ring_size, batch_size = self.GSP_RING_PAGES * 0x1000, self.GSP_STREAM_BATCH_PAGES * 0x1000
+    chained = bool((self.firmware_capabilities or 0) & self.FW_CAP_SRAM_STREAM and
+                   (self.firmware_revision or 0) >= self.FW_SRAM_STREAM_MIN_REVISION)
+    chunk_count = ceildiv(max(0, len(image) - ring_size), batch_size)
+    for i, (delay, start_slot, payload) in enumerate(self.gsp_stream_chunks(image)):
       deadline = launched_at + delay
       while time.perf_counter() < deadline: pass
-      self.scsi_write(payload, start_slot=start_slot)
+      if chained:
+        if i == 0: self.sram_stream_start(chunk_count, len(payload), start_slot)
+        self.usb.bulk_write(payload)
+      else: self.scsi_write(payload, start_slot=start_slot)
 
-  def scsi_read_arm(self, size:int):
-    windex = (ceildiv(size, 0x4000) & 0xFF) << 8
+  def scsi_read_arm(self, size:int, start_slot:int=0):
+    padded_size, num_slots = round_up(size, 512), ceildiv(size, 0x4000)
+    assert 0 < padded_size // 512 < 0x8000, f"invalid F2 sector count {padded_size // 512:#x}"
+    assert 0 <= start_slot < 32 and start_slot + num_slots <= 32, \
+      f"SRAM slot range {start_slot}:{start_slot+num_slots} is out of bounds"
+    windex = (start_slot & 0xFF) | ((num_slots & 0xFF) << 8)
     self.usb.control_write(0xF2, value=(ceildiv(size, 512) & 0x7FFF) | 0x8000, index=windex)
+
+  def sram_read(self, size:int, start_slot:int=0) -> memoryview:
+    self.scsi_read_arm(size, start_slot)
+    return self.usb.bulk_read(round_up(size, 512), timeout=10000)[:size]
 
   def scsi_read(self, size:int) -> memoryview: return self.usb.bulk_read(round_up(size, 512), timeout=10000)[:size]
 
@@ -295,11 +319,13 @@ class ASM24GSPQueueInterface(MMIOInterface):
   PAGE_SIZE, SLOT_SIZE, SRAM_SIZE = 0x1000, 0x4000, 0x80000
   PAGE_PADDRS = (0x213000, 0x253000, 0x24F000, 0x250000, 0x251000, 0x252000, 0x828000, 0x820000, 0x200000, 0x820000, 0x200000)
 
-  def __init__(self, usb:CustomASM24Controller, size:int=0xB000, fmt='B', offset:int=0, root:ASM24GSPQueueInterface|None=None):
+  def __init__(self, usb:CustomASM24Controller, size:int=0xB000, fmt='B', offset:int=0, root:ASM24GSPQueueInterface|None=None,
+               mirror:bytes|None=None):
     self.usb, self.offset, self.nbytes, self.fmt, self.el_sz = usb, offset, size, fmt, struct.calcsize(fmt)
     if root is None:
       assert size == len(self.PAGE_PADDRS) * self.PAGE_SIZE, f"invalid NVIDIA GSP queue allocation size {size:#x}"
-      self._root, self._mirror, self._direct_status = self, bytearray(self.SRAM_SIZE), True
+      if mirror is not None and len(mirror) != self.SRAM_SIZE: raise ValueError(f"invalid SRAM mirror size {len(mirror):#x}")
+      self._root, self._mirror, self._direct_status = self, bytearray(mirror or bytes(self.SRAM_SIZE)), True
     else: self._root = root
 
   def paddrs(self) -> list[int]: return list(self.PAGE_PADDRS)
