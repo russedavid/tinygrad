@@ -7,13 +7,14 @@ from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, H
 from tinygrad.runtime.support.hcq import MMIOInterface, FileIOInterface, hcq_filter_visible_devices, hcq_profile
 from tinygrad.uop.ops import sint
 from tinygrad.device import Compiled, BufferSpec, TinyELF
-from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent
+from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent, pluralize
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager
-from tinygrad.runtime.support.system import System, PCIIfaceBase, MAP_FIXED
+from tinygrad.runtime.support.system import System, PCIIfaceBase, USBPCIDevice, MAP_FIXED
+from tinygrad.runtime.support.usb import USB3
 from tinygrad.renderer.nir import NAKRenderer
 if getenv("IOCTL"): import extra.nv_gpu_driver.nv_ioctl # noqa: F401 # pylint: disable=unused-import
 
@@ -340,7 +341,9 @@ class NVProgram(HCQProgram['NVDevice']):
 
 class NVAllocator(HCQAllocator['NVDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:
-    return self.dev.iface.alloc(size, cpu_access=options.cpu_access, host=options.host)
+    kwargs = {}
+    if isinstance(self.dev.iface, USBIface) and options.host and not options.cpu_access: kwargs["zero"] = False
+    return self.dev.iface.alloc(size, cpu_access=options.cpu_access, host=options.host, **kwargs)
 
   def _do_free(self, opaque:HCQBuffer, options:BufferSpec): self.dev.iface.free(opaque)
 
@@ -560,6 +563,9 @@ class PCIIface(PCIIfaceBase):
     super().__init__(dev, dev_id, vendor=0x10de, devices=((0xff00, (0x2200,0x2400,0x2500,0x2600,0x2700,0x2800,0x2b00,0x2c00,0x2d00,0x2f00)),),
       base_class=0x03, vram_bar=1, va_start=NVMemoryManager.va_allocator.base, va_size=NVMemoryManager.va_allocator.size, dev_impl_t=NVDev)
 
+    self._init_nvd()
+
+  def _init_nvd(self):
     self.root, self.gpu_instance = 0xc1000000, 0
     self.rm_alloc(0, nv_gpu.NV01_ROOT, nv_gpu.NV0000_ALLOC_PARAMETERS())
 
@@ -574,22 +580,40 @@ class PCIIface(PCIIfaceBase):
   def rm_alloc(self, parent, clss, params=None, root=None) -> int: return self.dev_impl.gsp.rpc_rm_alloc(parent, clss, params, self.root)
   def rm_control(self, obj, cmd, params=None, **kwargs): return self.dev_impl.gsp.rpc_rm_control(obj, cmd, params, self.root, **kwargs)
 
-  def device_fini(self): self.dev_impl.fini()
+  def device_fini(self): self.dev_impl.fini(self.root)
 
   def sleep(self, timeout):
     for _ in self.dev_impl.gsp.stat_q.read_resp(): pass
     if self.dev_impl.is_err_state: raise RuntimeError("Device fault detected")
 
+class USBIface(PCIIface):
+  def __init__(self, dev, dev_id): # pylint: disable=super-init-not-called
+    if dev_id >= len(visible:=hcq_filter_visible_devices(USB3.list_devices(0xADD1, 0x0001) + USB3.list_devices(0x3801, 0x0001), "NV")):
+      raise RuntimeError(f"NV:{dev_id} does not exist ({pluralize('device', len(visible))} available)")
+    self.dev, self.pci_dev, self.vram_bar, self.count = dev, USBPCIDevice("NV", *visible[dev_id]), 1, len(visible)
+    self.dev_impl = NVDev(self.pci_dev)
+    self._init_nvd()
+
+  def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, **kwargs) -> HCQBuffer:
+    # keep usb host buffers in bar1-visible vram
+    cpu_visible = cpu_access
+    if host: contiguous, cpu_visible = True, True
+    ret = super().alloc(size, host=False, uncached=uncached, cpu_access=cpu_access, contiguous=contiguous, force_devmem=True,
+                        cpu_visible=cpu_visible, **kwargs)
+    if host and not cpu_access: ret.view = self.pci_dev.map_bar(self.vram_bar, off=ret.meta.mapping.paddrs[0][0], size=ret.meta.mapping.size)
+    return ret
+
 class MOCKIface(NVKIface): count = 1
 
 class NVDevice(HCQCompiled[NVSignal]):
-  ifaces = [NVKIface, PCIIface, MOCKIface]
+  ifaces = [NVKIface, PCIIface, USBIface, MOCKIface]
 
   def is_nvd(self) -> bool: return isinstance(self.iface, PCIIface)
 
   def __init__(self, device:str=""):
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
     self.iface = self._select_iface()
+    self._finalized = False
 
     device_params = nv_gpu.NV0080_ALLOC_PARAMETERS(deviceId=self.iface.gpu_instance, hClientShare=self.iface.root,
                                                    vaMode=nv_gpu.NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES)
@@ -639,6 +663,11 @@ class NVDevice(HCQCompiled[NVSignal]):
     if self.pma_enabled: self._prof_init()
 
     self._setup_gpfifos()
+
+  def finalize(self):
+    if self._finalized: return
+    super().finalize()
+    self._finalized = True
 
   def _new_gpu_fifo(self, gpfifo_area, ctxshare, channel_group, offset=0, entries=0x400, compute=False, video=False) -> GPFifo:
     notifier = self.iface.alloc(48 << 20, uncached=True)
