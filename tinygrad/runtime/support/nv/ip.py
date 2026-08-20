@@ -28,6 +28,11 @@ class NVRpcQueue:
 
     self.gsp, self.view, self.seq = gsp, view, 0
     self.queue_mv = view.view(self.tx.entryOff, self.tx.msgSize * self.tx.msgCount)
+    self._direct_transport = getattr(getattr(view, "_root", None), "_direct_status", False)
+    self._direct_status = completion_q_view is not None and self._direct_transport
+    self._direct_cursor:int|None = 0 if self._direct_status else None
+    self._reserve_direct_credit = self._direct_status and getattr(getattr(view, "_root", None), "_reserve_status_credit", False)
+    self._direct_status_capacity = getattr(getattr(view, "_root", None), "_direct_status_capacity", self.tx.msgCount)
 
   def _checksum(self, data:bytes):
     if (pad_len:=(-len(data)) % 8): data += b'\x00' * pad_len
@@ -46,6 +51,8 @@ class NVRpcQueue:
     elem = nv.GSP_MSG_QUEUE_ELEMENT.from_buffer_copy(prefix[:transport_size])
     hdr = nv.rpc_message_header_v.from_buffer_copy(prefix[transport_size:])
     if not 1 <= elem.elemCount <= self.tx.msgCount: raise RuntimeError(f"invalid RPC element count {elem.elemCount:#x} at slot {rx:#x}")
+    if self._direct_status and elem.elemCount > self._direct_status_capacity:
+      raise RuntimeError(f"RPC record needs {elem.elemCount} elements but direct transport has {self._direct_status_capacity} physical slots")
     capacity = elem.elemCount * self.tx.msgSize - transport_size
     if not rpc_header_size <= hdr.length <= capacity: raise RuntimeError(f"invalid RPC length {hdr.length:#x}/{capacity:#x} at slot {rx:#x}")
     if hdr.signature != nv.NV_VGPU_MSG_SIGNATURE_VALID: raise RuntimeError(f"invalid RPC signature {hdr.signature:#x} at slot {rx:#x}")
@@ -66,6 +73,30 @@ class NVRpcQueue:
     if hdr.rpc_result != 0: raise RuntimeError(f"RPC call {hdr.function} failed with result {hdr.rpc_result}")
     return hdr.function, msg
 
+  def _read_direct_resp(self):
+    write_index = getattr(nv.msgqTxHeader, 'writePtr').offset // 4
+    assert self._direct_cursor is not None
+    while self._direct_cursor != self.tx_view[write_index]:
+      wp, records = self.tx_view[write_index], []
+      while self._direct_cursor != wp:
+        for attempt in range(3):
+          try:
+            elem, hdr, raw = self._read_record(self._direct_cursor)
+            break
+          except RuntimeError:
+            if attempt == 2: raise
+        records.append((elem, hdr, raw))
+        self._direct_cursor = (self._direct_cursor + elem.elemCount) % self.tx.msgCount
+      # Keep one slot logically occupied only for the four-entry A/F/A/F compatibility layout.
+      self.rx_view[0] = (self._direct_cursor - 1) % self.tx.msgCount if self._reserve_direct_credit else self._direct_cursor
+      System.memory_barrier()
+      for record in records: yield self._handle_record(*record)
+
+  def release_direct_credit(self):
+    if not self._reserve_direct_credit or self._direct_cursor is None: return
+    self.rx_view[0] = self._direct_cursor
+    System.memory_barrier()
+
   def _send_rpc_record(self, func:int, msg:bytes):
     header = nv.rpc_message_header_v(signature=nv.NV_VGPU_MSG_SIGNATURE_VALID, rpc_result=nv.NV_VGPU_MSG_RESULT_RPC_PENDING,
       rpc_result_private=nv.NV_VGPU_MSG_RESULT_RPC_PENDING, header_version=(3<<24), function=func, length=len(msg) + 0x20)
@@ -83,7 +114,7 @@ class NVRpcQueue:
     System.memory_barrier()
 
     self.seq += 1
-    if getattr(self.gsp.nvdev.pci_dev, "gsp_sram_boot", False) and hasattr(self.gsp, "stat_q"): self.gsp.invalidate_rpc_memory()
+    if self._direct_transport and hasattr(self.gsp, "stat_q"): self.gsp.invalidate_rpc_memory()
     self.gsp.nvdev.NV_PGSP_QUEUE_HEAD[0].write(0x0)
 
   def send_rpc(self, func:int, msg:bytes):
@@ -93,6 +124,9 @@ class NVRpcQueue:
 
   def read_resp(self):
     System.memory_barrier()
+    if self._direct_status:
+      yield from self._read_direct_resp()
+      return
     while self.rx_view[0] != self.tx_view[getattr(nv.msgqTxHeader, 'writePtr').offset // 4]:
       elem, hdr, raw = self._read_record(self.rx_view[0])
       # Update the read pointer
@@ -503,8 +537,10 @@ class NV_GSP(NV_IP):
     # self.cmd_q_va, self.stat_q_va = queues_view.addr + pt_size, queues_view.addr + pt_size + queue_size
     self.cmd_q_view, self.stat_q_view = queues_view.view(pt_size), queues_view.view(pt_size + queue_size)
 
-    self.cmd_q_view[:ctypes.sizeof(nv.msgqTxHeader)] = bytes(nv.msgqTxHeader(version=0, size=queue_size, entryOff=0x1000, msgSize=0x1000,
-      msgCount=(queue_size - 0x1000) // 0x1000, writePtr=0, flags=1, rxHdrOff=ctypes.sizeof(nv.msgqTxHeader)))
+    cmd_hdr = nv.msgqTxHeader(version=0, size=queue_size, entryOff=0x1000, msgSize=0x1000,
+      msgCount=(queue_size - 0x1000) // 0x1000, writePtr=0, flags=1, rxHdrOff=ctypes.sizeof(nv.msgqTxHeader))
+    self.cmd_q_view[:ctypes.sizeof(nv.msgqTxHeader)] = bytes(cmd_hdr)
+    if getattr(queues_view, "_reserve_status_credit", False): self.cmd_q_view.view(cmd_hdr.rxHdrOff, fmt='I')[0] = cmd_hdr.msgCount - 1
 
     self.cmd_q = NVRpcQueue(self, self.cmd_q_view, None)
 
@@ -618,7 +654,9 @@ class NV_GSP(NV_IP):
     res, prom = {}, nv_gpu.NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS(entryCount=len(ctxbufs), engineType=0x1, hChanClient=client, hObject=obj)
     for i,(buf,desc) in enumerate(ctxbufs.items()):
       use_v, use_p = (desc.virt if virt is None else virt), (desc.phys if phys is None else phys)
-      x = bufs[buf] if bufs is not None and buf in bufs else self.nvdev.mm.valloc_cpu_visible(desc.size, zero=use_p)
+      # GSP initializes physical context buffers through bInitialize; avoid redundantly clearing them over USB.
+      zero = use_p and not getattr(self.nvdev.pci_dev, "gsp_sram_boot", False)
+      x = bufs[buf] if bufs is not None and buf in bufs else self.nvdev.mm.valloc_cpu_visible(desc.size, zero=zero)
       prom.promoteEntry[i] = nv_gpu.NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY(bufferId=buf, gpuVirtAddr=x.va_addr if use_v else 0, bInitialize=use_p,
         gpuPhysAddr=x.paddrs[0][0] if use_p else 0, size=desc.size if use_p else 0, physAttr=0x4 if use_p else 0, bNonmapped=(use_p and not use_v))
       res[buf] = x
@@ -778,6 +816,7 @@ class NV_GSP(NV_IP):
     data = nv.rpc_unloading_guest_driver_v(bInPMTransition=0, bGc6Entering=0, newLevel=(__GPU_STATE_FLAGS_FAST_UNLOAD:=1 << 6))
     self.cmd_q.send_rpc(nv.NV_VGPU_MSG_FUNCTION_UNLOADING_GUEST_DRIVER, bytes(data))
     self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_UNLOADING_GUEST_DRIVER)
+    self.stat_q.release_direct_credit()
 
   def rpc_set_registry_table(self):
     table = {'RMForcePcieConfigSave': 0x1, 'RMSecBusResetEnable': 0x1}

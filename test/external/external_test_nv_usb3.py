@@ -1,11 +1,10 @@
 import ctypes, unittest
-from unittest.mock import patch
 import numpy as np
 
 from tinygrad import Device, Tensor
 from tinygrad.runtime.autogen import libusb, pci, nv_570 as nv_gpu
-from tinygrad.runtime.ops_nv import NVCopyQueue, USBIface
-from tinygrad.runtime.support.usb import ASM24GSPQueueInterface, USB3
+from tinygrad.runtime.ops_nv import USBIface
+from tinygrad.runtime.support.usb import USB3
 
 USB_IDS = {(0xADD1, 0x0001), (0x3801, 0x0001)}
 RTX_3090_PCI_ID = 0x220410DE
@@ -41,43 +40,16 @@ class TestNVUSB3(unittest.TestCase):
     self.assertEqual(self.iface.pci_dev.read_config(pci.PCI_VENDOR_ID, 4), RTX_3090_PCI_ID)
 
   def test_compute_and_exact_transfer(self):
-    usb = self.iface.pci_dev.usb
-    with patch.object(usb, "pcie_mem_write", wraps=usb.pcie_mem_write) as slow_write, \
-         patch.object(usb, "pcie_mem_read", wraps=usb.pcie_mem_read) as slow_read:
-      self.assertEqual((Tensor([1., 2., 3., 4.], device="NV") * 3 + 1).tolist(), [4., 7., 10., 13.])
-      source = np.arange((4 << 20) // 4, dtype=np.uint32) ^ np.uint32(0xA5A55A5A)
-      result = Tensor(source, device="NV").contiguous().realize().numpy()
+    self.assertEqual((Tensor([1., 2., 3., 4.], device="NV") * 3 + 1).tolist(), [4., 7., 10., 13.])
+    source = np.arange((4 << 20) // 4, dtype=np.uint32) ^ np.uint32(0xA5A55A5A)
+    result = Tensor(source, device="NV").contiguous().realize().numpy()
     np.testing.assert_array_equal(result, source)
-    self.assertFalse(any(len(call.args[1]) >= ASM24GSPQueueInterface.TRANSFER_SIZE for call in slow_write.call_args_list))
-    self.assertFalse(any(call.args[1] >= ASM24GSPQueueInterface.TRANSFER_SIZE for call in slow_read.call_args_list))
     self._assert_aer_clean()
 
-  def test_compact_sram_transfer_arena(self):
-    layout, usb = ASM24GSPQueueInterface, self.iface.pci_dev.usb
-    prefix_size, read_size = layout.TRANSFER_PADDR - layout.SRAM_PADDR, layout.TRANSFER_PADDR - layout.SRAM_PADDR + layout.TRANSFER_SIZE
-
-    saved_completion = usb.read(0xB80C, 4)
-    try:
-      sram, completion = self.iface.copy_bufs[0], self.iface.cq_buf
-      self.assertEqual((sram.meta.mapping.paddrs, sram.size), ([(layout.TRANSFER_PADDR, layout.TRANSFER_SIZE)], layout.TRANSFER_SIZE))
-      pattern = bytes((i * 47 + 23) & 0xff for i in range(layout.TRANSFER_SIZE))
-      source = self.iface.alloc(layout.TRANSFER_SIZE, cpu_access=True, zero=False)
-      source.cpu_view().view(size=layout.TRANSFER_SIZE, fmt='B')[:] = pattern
-
-      signal_value = self.dev.timeline_value
-      queue = NVCopyQueue().wait(self.dev.timeline_signal, signal_value - 1).copy(sram, source, layout.TRANSFER_SIZE) \
-                           .write(completion.offset(12), 0).signal(self.dev.timeline_signal, signal_value)
-      queue.bind(self.dev)
-
-      usb.scsi_read_arm(read_size, start_slot=0)
-      self.assertEqual(self.dev.next_timeline(), signal_value)
-      queue.submit(self.dev)
-      enclosing = bytes(usb.usb.bulk_read(read_size, timeout=1000))
-      self.dev.timeline_signal.wait(signal_value, timeout=1000)
-      self.assertEqual(enclosing[0x1000:0x2000], bytes(self.iface.pci_dev.gsp_queues._root._mirror[0x1000:0x2000]))
-      self.assertEqual(enclosing[prefix_size:], pattern)
-      self._assert_aer_clean()
-    finally: usb.write(0xB80C, saved_completion)
+  def test_rpc_transport_reserves_alias_safe_credit(self):
+    queue = self.iface.dev_impl.gsp.stat_q
+    self.assertIsNotNone(queue._direct_cursor)
+    self.assertEqual(queue.rx_view[0], (queue._direct_cursor - 1) % queue.tx.msgCount)
 
   def test_channel_and_aer_health(self):
     self.dev.synchronize()

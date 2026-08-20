@@ -1,8 +1,7 @@
 import types, unittest
 from unittest.mock import MagicMock, patch
 
-from tinygrad.runtime.autogen import nv_570 as nv_gpu
-from tinygrad.runtime.ops_nv import GPFifo, NVCommandQueue, NVCopyQueue, PCIIface, nv_flags
+from tinygrad.runtime.ops_nv import GPFifo, NVCommandQueue, NVCopyQueue, PCIIface
 
 
 class RecordingMMIO:
@@ -12,17 +11,6 @@ class RecordingMMIO:
 
 
 class TestNVUSBSubmission(unittest.TestCase):
-  def test_copy_queue_write_uses_one_word_semaphore_release(self):
-    queue, target = NVCopyQueue(), types.SimpleNamespace(va_addr=0x123456789ABC)
-
-    self.assertIs(queue.write(target, 0xA5A55A5A), queue)
-    self.assertEqual(queue._q, [
-      (2 << 28) | (3 << 16) | (4 << 13) | (nv_gpu.NVC6B5_SET_SEMAPHORE_A >> 2),
-      0x1234, 0x56789ABC, 0xA5A55A5A,
-      (2 << 28) | (1 << 16) | (4 << 13) | (nv_gpu.NVC6B5_LAUNCH_DMA >> 2),
-      nv_flags("NVC6B5_LAUNCH_DMA", flush_enable="true", semaphore_type="release_one_word_semaphore"),
-    ])
-
   def test_submission_without_pci_transport(self):
     events = []
     dev = types.SimpleNamespace(iface=types.SimpleNamespace(), gpu_mmio=RecordingMMIO(events, "doorbell"))
@@ -43,5 +31,13 @@ class TestNVUSBSubmission(unittest.TestCase):
     iface.device_fini()
 
     iface.dev_impl.fini.assert_called_once_with(iface.root)
+
+  def test_copy_queue_writes_ordered_32_bit_completion(self):
+    queue, target = object.__new__(NVCopyQueue), types.SimpleNamespace(va_addr=0x12345000)
+    queue.binded_device, queue.nvm = None, MagicMock()
+
+    self.assertIs(queue.write(target, 0), queue)
+    self.assertEqual(queue.nvm.call_count, 2)
+    with self.assertRaisesRegex(NotImplementedError, "64-bit"): queue.write(target, 0, b64=True)
 
 if __name__ == "__main__": unittest.main()

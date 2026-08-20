@@ -210,7 +210,8 @@ class NVCopyQueue(NVCommandQueue):
   def write(self, b:HCQBuffer, val:sint, b64:bool=False):
     if b64: raise NotImplementedError("64-bit copy queue writes are not supported")
     self.nvm(4, nv_gpu.NVC6B5_SET_SEMAPHORE_A, *data64(b.va_addr), val)
-    self.nvm(4, nv_gpu.NVC6B5_LAUNCH_DMA, nv_flags("NVC6B5_LAUNCH_DMA", flush_enable="true", semaphore_type="release_one_word_semaphore"))
+    self.nvm(4, nv_gpu.NVC6B5_LAUNCH_DMA,
+             nv_flags("NVC6B5_LAUNCH_DMA", flush_enable="true", semaphore_type="release_one_word_semaphore"))
     return self
 
   def signal(self, signal:HCQSignal, value:sint=0):
@@ -349,31 +350,37 @@ class NVProgram(HCQProgram['NVDevice']):
 
 class NVAllocator(HCQAllocator['NVDevice']):
   def __init__(self, dev):
-    super().__init__(dev, copy_bufs=getattr(dev.iface, "copy_bufs", None), supports_transfer=not isinstance(dev.iface, USBIface))
+    is_usb = isinstance(dev.iface, USBIface)
+    super().__init__(dev, copy_bufs=getattr(dev.iface, "copy_bufs", None), batch_cnt=1 if is_usb else 32, supports_transfer=not is_usb)
 
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:
-    return self.dev.iface.alloc(size, cpu_access=options.cpu_access, host=options.host)
+    kwargs = {"zero": False} if isinstance(self.dev.iface, USBIface) else {}
+    return self.dev.iface.alloc(size, cpu_access=options.cpu_access, host=options.host, **kwargs)
 
   def _copyout(self, dest:memoryview, src:HCQBuffer):
-    if not isinstance(self.dev.iface, USBIface): return super()._copyout(dest, src)
+    if not isinstance(self.dev.iface, USBIface) or not hasattr(self.dev.iface, "cq_buf"): return super()._copyout(dest, src)
     self.dev.synchronize()
-    prefix_size = ASM24GSPQueueInterface.TRANSFER_PADDR - ASM24GSPQueueInterface.SRAM_PADDR
+    prefix_size = ASM24GSPQueueInterface.TRANSFER_START_SLOT * ASM24GSPQueueInterface.SLOT_SIZE
     with hcq_profile(self.dev, queue_type=self.dev.hw_copy_queue_t, desc=TracingKey(f"{self.dev.device} -> TINY", ret=dest.nbytes), enabled=PROFILE,
                      dev_suff="SDMA:0"):
       for i in range(0, dest.nbytes, self.b[0].size):
         completion = self.dev.iface.cq_buf.offset(12, 4)
-        queue = NVCopyQueue().wait(self.dev.timeline_signal, (signal_value:=self.dev.timeline_value) - 1) \
+        signal_value = self.dev.timeline_value
+        queue = NVCopyQueue().wait(self.dev.timeline_signal, signal_value - 1) \
                              .copy(self.b[0], src.offset(i), lsize:=min(self.b[0].size, dest.nbytes - i)) \
                              .write(completion, 0).signal(self.dev.timeline_signal, signal_value)
         queue.bind(self.dev)
 
         saved_completion, read_size = bytes(completion.cpu_view()[:]), prefix_size + lsize
-        self.dev.iface.pci_dev.usb.scsi_read_arm(read_size, start_slot=0)
-        self.dev.next_timeline()
-        queue.submit(self.dev)
-        enclosing = self.dev.iface.pci_dev.usb.usb.bulk_read(round_up(read_size, 512), timeout=1000)
-        dest.cast('B')[i:i+lsize] = enclosing[prefix_size:read_size]
-        completion.cpu_view()[:] = saved_completion
+        try:
+          self.dev.iface.pci_dev.usb.scsi_read_arm(read_size, start_slot=0)
+          assert self.dev.next_timeline() == signal_value
+          queue.submit(self.dev)
+          enclosing = self.dev.iface.pci_dev.usb.usb.bulk_read(round_up(read_size, 512), timeout=1000)
+          self.dev.timeline_signal.wait(signal_value, timeout=1000)
+          dest.cast('B')[i:i+lsize] = enclosing[prefix_size:read_size]
+        finally:
+          completion.cpu_view()[:] = saved_completion
 
   def _do_free(self, opaque:HCQBuffer, options:BufferSpec): self.dev.iface.free(opaque)
 
@@ -623,9 +630,10 @@ class USBIface(PCIIface):
     self.dev, self.pci_dev, self.vram_bar, self.count = dev, USBPCIDevice("NV", *visible[dev_id]), 1, len(visible)
     self.dev_impl = NVDev(self.pci_dev)
     self._init_nvd()
-    self.copy_bufs = [self._dma_region(0xF000, ASM24GSPQueueInterface.TRANSFER_PADDR, ASM24GSPQueueInterface.TRANSFER_SIZE,
-                                      start_slot=ASM24GSPQueueInterface.TRANSFER_START_SLOT)]
-    self.cq_buf = self._dma_region(0xB800, 0x828000, 0x1000)
+    if getenv("NV_USB_F2", 1):
+      self.copy_bufs = [self._dma_region(0xF000, ASM24GSPQueueInterface.TRANSFER_PADDR, ASM24GSPQueueInterface.TRANSFER_SIZE,
+                                        start_slot=ASM24GSPQueueInterface.TRANSFER_START_SLOT)]
+      self.cq_buf = self._dma_region(0xB800, 0x828000, 0x1000)
 
   def _dma_region(self, ctrl_addr:int, sys_addr:int, size:int, start_slot:int=0) -> HCQBuffer:
     mapping = self.dev_impl.mm.map_range(self.dev_impl.mm.alloc_vaddr(size), size, [(sys_addr, size)], aspace=AddrSpace.SYS, uncached=True)
@@ -634,6 +642,7 @@ class USBIface(PCIIface):
 
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, **kwargs) -> HCQBuffer:
     # keep usb host buffers in bar1-visible vram
+    kwargs.setdefault("zero", False)
     cpu_visible = cpu_access
     if host: contiguous, cpu_visible = True, True
     ret = super().alloc(size, host=False, uncached=uncached, cpu_access=cpu_access, contiguous=contiguous, force_devmem=True,

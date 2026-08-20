@@ -226,19 +226,6 @@ class CustomASM24Controller:
     windex = (start_slot & 0xFF) | ((num_slots & 0xFF) << 8)
     self.usb.control_write(0xF2, value=(ceildiv(size, 512) & 0x7FFF) | 0x8000, index=windex)
 
-  def sram_read(self, offset:int, size:int) -> bytes:
-    assert 0 <= offset <= 0x80000 and 0 <= size <= 0x80000 - offset, f"SRAM read {offset:#x}+{size:#x} is out of bounds"
-    if size == 0: return b''
-    slot, slot_offset = divmod(offset, 0x4000)
-    assert slot_offset + size <= 0x1000, "F6 reads must fit within the first 4 KiB page of one SRAM slot"
-    first_sector, last_sector = slot_offset // 512, ceildiv(slot_offset + size, 512)
-    self.usb.control_write(0xF6, value=slot, index=first_sector | ((last_sector - first_sector) << 8))
-    expected_size = (last_sector - first_sector) * 512
-    data = bytes(self.usb.bulk_read(expected_size))
-    if len(data) != expected_size: raise RuntimeError(f"SRAM slot {slot:#x} short read: {len(data)}/{expected_size} bytes")
-    start = slot_offset - first_sector * 512
-    return data[start:start+size]
-
   def scsi_read(self, size:int) -> memoryview: return self.usb.bulk_read(round_up(size, 512), timeout=10000)[:size]
 
 class USBMMIOInterface(MMIOInterface):
@@ -288,13 +275,10 @@ class USBMMIOInterface(MMIOInterface):
 
 class ASM24GSPQueueInterface(MMIOInterface):
   PAGE_SIZE, SLOT_SIZE, SRAM_SIZE, SRAM_PADDR = 0x1000, 0x4000, 0x80000, 0x200000
-  PTE_PADDR = SRAM_PADDR + PAGE_SIZE
-  STATUS_PADDRS = (SRAM_PADDR, SRAM_PADDR + SLOT_SIZE, SRAM_PADDR + 2 * SLOT_SIZE,
-                   SRAM_PADDR + 3 * SLOT_SIZE, SRAM_PADDR + 4 * SLOT_SIZE)
   TRANSFER_START_SLOT, TRANSFER_SLOT_COUNT = 5, 25
   TRANSFER_PADDR, TRANSFER_SIZE = SRAM_PADDR + TRANSFER_START_SLOT * SLOT_SIZE, TRANSFER_SLOT_COUNT * SLOT_SIZE
-  COMMAND_PADDRS = (0x27F000, 0x27B000, 0x27C000, 0x27D000, 0x27E000)
-  PAGE_PADDRS = (PTE_PADDR, *COMMAND_PADDRS, *STATUS_PADDRS)
+  PAGE_PADDRS = (0x213000, 0x27F000, 0x27B000, 0x27C000, 0x27D000, 0x27E000,
+                 0x828000, 0x820000, 0x200000, 0x820000, 0x200000)
 
   def __init__(self, usb:CustomASM24Controller, size:int=0xB000, fmt='B', offset:int=0, root:ASM24GSPQueueInterface|None=None,
                mirror:bytes|None=None):
@@ -302,10 +286,17 @@ class ASM24GSPQueueInterface(MMIOInterface):
     if root is None:
       assert size == len(self.PAGE_PADDRS) * self.PAGE_SIZE, f"invalid NVIDIA GSP queue allocation size {size:#x}"
       if mirror is not None and len(mirror) != self.SRAM_SIZE: raise ValueError(f"invalid SRAM mirror size {len(mirror):#x}")
-      self._root, self._mirror = self, bytearray(mirror or bytes(self.SRAM_SIZE))
+      self._root, self._mirror, self._direct_status = self, bytearray(mirror or bytes(self.SRAM_SIZE)), True
+      self._paddrs = self.PAGE_PADDRS
+      status_paddrs = self._paddrs[7:]
+      self._reserve_status_credit = len(status_paddrs) != len(set(status_paddrs))
+      self._direct_status_capacity = len(set(status_paddrs))
+      if self._reserve_status_credit:
+        assert self._direct_status_capacity == 2 and all(status_paddrs[i] != status_paddrs[(i+1) % len(status_paddrs)]
+                                                         for i in range(len(status_paddrs))), "folded GSP status pages must alternate"
     else: self._root = root
 
-  def paddrs(self) -> list[int]: return list(self.PAGE_PADDRS)
+  def paddrs(self) -> list[int]: return list(self._root._paddrs)
 
   def __len__(self): return self.nbytes // self.el_sz
 
@@ -316,26 +307,27 @@ class ASM24GSPQueueInterface(MMIOInterface):
       return start * self.el_sz, (stop - start) * self.el_sz
     return index * self.el_sz, self.el_sz
 
-  def _page_offset(self, logical_page:int) -> int:
-    paddr = self.PAGE_PADDRS[logical_page]
-    if not self.SRAM_PADDR <= paddr < self.SRAM_PADDR + self.SRAM_SIZE:
-      raise ValueError(f"GSP queue page {paddr:#x} is outside ASM2464 SRAM")
-    return paddr - self.SRAM_PADDR
+  def _page_mapping(self, logical_page:int) -> tuple[str, int]:
+    paddr = self._root._paddrs[logical_page]
+    if logical_page > 6 and paddr == 0x200000: return "xdata", 0xF000
+    if 0x200000 <= paddr < 0x280000: return "sram", paddr - 0x200000
+    return "xdata", {0x820000: 0xA000, 0x828000: 0xB800}[paddr]
 
   def _pieces(self, offset:int, size:int):
     end = offset + size
     while offset < end:
       page, page_off = divmod(offset, self.PAGE_SIZE)
       chunk = min(end - offset, self.PAGE_SIZE - page_off)
-      yield self._page_offset(page) + page_off, chunk, page >= 6
+      kind, mapped = self._page_mapping(page)
+      yield kind, mapped + page_off, chunk
       offset += chunk
 
   def __getitem__(self, index):
     off, size = self._off_from_index(index)
     assert 0 <= off <= self.nbytes and off + size <= self.nbytes
     absolute, out = self.offset + off, bytearray()
-    for mapped, chunk, live in self._pieces(absolute, size):
-      out += self.usb.sram_read(mapped, chunk) if live else self._root._mirror[mapped:mapped+chunk]
+    for kind, mapped, chunk in self._pieces(absolute, size):
+      out += self.usb.read(mapped, chunk) if kind == "xdata" else self._root._mirror[mapped:mapped+chunk]
     if isinstance(index, slice): return bytes(out) if self.fmt == 'B' else memoryview(out).cast(self.fmt).tolist()
     return int.from_bytes(out, "little")
 
@@ -345,18 +337,23 @@ class ASM24GSPQueueInterface(MMIOInterface):
     raw = struct.pack(self.fmt, data) if isinstance(data, int) else bytes(data)
     assert len(raw) == size, f"queue write size mismatch: {len(raw)} != {size}"
 
-    dirty_slots:set[int] = set()
+    dirty_slots:dict[int, list[int]] = {}
     pos = 0
-    for mapped, chunk, _ in self._pieces(self.offset + off, size):
-      self._root._mirror[mapped:mapped+chunk] = raw[pos:pos+chunk]
-      dirty_slots.update(range(mapped // self.SLOT_SIZE, ceildiv(mapped + chunk, self.SLOT_SIZE)))
+    for kind, mapped, chunk in self._pieces(self.offset + off, size):
+      if kind == "xdata": self.usb.write(mapped, raw[pos:pos+chunk])
+      else:
+        self._root._mirror[mapped:mapped+chunk] = raw[pos:pos+chunk]
+        for slot in range(mapped // self.SLOT_SIZE, ceildiv(mapped + chunk, self.SLOT_SIZE)):
+          slot_base = slot * self.SLOT_SIZE
+          lo, hi = max(mapped, slot_base), min(mapped + chunk, slot_base + self.SLOT_SIZE)
+          extent = dirty_slots.setdefault(slot, [lo, hi])
+          extent[0], extent[1] = min(extent[0], lo), max(extent[1], hi)
       pos += chunk
 
-    slots = sorted(dirty_slots)
-    while slots:
-      start = end = slots.pop(0)
-      while slots and slots[0] == end + 1: end = slots.pop(0)
-      self.usb.scsi_write(bytes(self._root._mirror[start*self.SLOT_SIZE:(end+1)*self.SLOT_SIZE]), start_slot=start)
+    for slot, (lo, hi) in sorted(dirty_slots.items()):
+      slot_base = slot * self.SLOT_SIZE
+      transfer_size = round_up(hi - slot_base, 512) if slot_base <= lo and hi <= slot_base + self.PAGE_SIZE else self.SLOT_SIZE
+      self.usb.scsi_write(bytes(self._root._mirror[slot_base:slot_base+transfer_size]), start_slot=slot)
 
   def view(self, offset:int=0, size:int|None=None, fmt=None):
     assert 0 <= offset <= self.nbytes and (size is None or offset + size <= self.nbytes)

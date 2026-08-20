@@ -248,11 +248,11 @@ class USBPCIDevice(PCIDevice):
   def __init__(self, devpref:str, dev, pcibus):
     self.devpref, self.pcibus, self.peer_group = devpref, pcibus, f"USBPCIDevice_{pcibus}"
     is_nv = devpref == "NV"
-    self.boot_mem_in_vram = self.skip_gsp_registry = self.gsp_sram_boot = self.gsp_full_teardown = is_nv
+    self.boot_mem_in_vram = self.gsp_sram_boot = self.gsp_full_teardown = is_nv
+    self.skip_gsp_registry = False
     self.gsp_flr_recovery = False
     self.gsp_queue_size = 0x5000 if is_nv else None
-    # Initial GA102 boot drains hundreds of fixed-window NOCAT records before CPU-sequencer/INIT_DONE.
-    self.gsp_rpc_timeout_ms = 120000 if is_nv else None
+    self.gsp_rpc_timeout_ms = 3000 if is_nv else None
     self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
     usb = USB3(dev)
     if DEBUG >= 1: print(f"{devpref.lower()} {self.pcibus}: product string: {usb.product!r}")
@@ -408,7 +408,7 @@ class PCIIfaceBase:
     self.dev, self.vram_bar, self.count = dev, vram_bar, len(hcq_filter_visible_devices(System.list_devices(vendor, devices, base_class), dn))
 
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, **kwargs) -> HCQBuffer:
-    cpu_visible = kwargs.pop("cpu_visible", False)
+    cpu_visible, zero = kwargs.pop("cpu_visible", False), kwargs.pop("zero", True)
     should_use_sysmem = host or ((cpu_access if self.is_bar_small() else (uncached and cpu_access)) and not force_devmem)
 
     # Align size to huge pages for large allocations, otherwise the unaligned tail falls back to 4KB pages, increasing TLB pressure.
@@ -421,7 +421,7 @@ class PCIIfaceBase:
       return HCQBuffer(vaddr, size, meta=PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=paddrs[0]), view=memview, owner=self.dev)
 
     size = round_up(size, 0x1000)
-    if cpu_visible: mapping = self.dev_impl.mm.valloc_cpu_visible(size, uncached=uncached)
+    if cpu_visible: mapping = self.dev_impl.mm.valloc_cpu_visible(size, uncached=uncached, zero=zero)
     else: mapping = self.dev_impl.mm.valloc(size, uncached=uncached, contiguous=contiguous or cpu_access)
     barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size) if cpu_access else None
     return HCQBuffer(mapping.va_addr, size, view=barview, meta=PCIAllocationMeta(mapping, cpu_access, hMemory=mapping.paddrs[0][0]), owner=self.dev)

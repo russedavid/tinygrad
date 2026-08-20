@@ -7,6 +7,22 @@ from tinygrad.runtime.support.system import USBPCIDevice
 from tinygrad.runtime.support.usb import CustomASM24Controller
 
 class TestNVGSPSRAMBoot(unittest.TestCase):
+  def test_direct_gsp_queue_reserves_one_status_credit_before_boot(self):
+    gsp = object.__new__(NV_GSP)
+    queues_view, cmd_view, stat_view, credit_view = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+    queues_view._direct_status, queues_view._reserve_status_credit = True, True
+    queues_view.view.side_effect = [cmd_view, stat_view]
+    cmd_view.view.return_value = credit_view
+    paddrs = [0x200000 + page * 0x1000 for page in range(11)]
+    pci_dev = types.SimpleNamespace(gsp_queue_size=0x5000, alloc_gsp_queues=MagicMock(return_value=(queues_view, paddrs)))
+    gsp.nvdev, gsp._stage_args = types.SimpleNamespace(pci_dev=pci_dev), MagicMock(return_value=0x1234)
+
+    with patch("tinygrad.runtime.support.nv.ip.NVRpcQueue", return_value=MagicMock()): gsp.init_rm_args()
+
+    credit_view.__setitem__.assert_called_once_with(0, 3)
+    header = nv.msgqTxHeader.from_buffer_copy(cmd_view.__setitem__.call_args.args[1])
+    self.assertEqual((header.msgCount, header.rxHdrOff), (4, 32))
+
   @staticmethod
   def booter_blob():
     blob = bytearray(0xc0)
@@ -285,6 +301,28 @@ class TestNVGSPSRAMBoot(unittest.TestCase):
 
     gsp.rpc_unloading_guest_driver.assert_called_once_with()
     self.assertEqual(mailbox.with_base.call_args_list, [call(0x110000), call(0x110000)])
+
+  def test_gsp_unload_releases_reserved_status_credit(self):
+    gsp = object.__new__(NV_GSP)
+    gsp.cmd_q, gsp.stat_q = MagicMock(), MagicMock()
+
+    gsp.rpc_unloading_guest_driver()
+
+    gsp.cmd_q.send_rpc.assert_called_once()
+    gsp.stat_q.wait_resp.assert_called_once_with(nv.NV_VGPU_MSG_FUNCTION_UNLOADING_GUEST_DRIVER)
+    gsp.stat_q.release_direct_credit.assert_called_once_with()
+
+  def test_usb_context_buffers_rely_on_gsp_initialization(self):
+    gsp = object.__new__(NV_GSP)
+    mapping = MagicMock()
+    gsp.nvdev = types.SimpleNamespace(pci_dev=types.SimpleNamespace(gsp_sram_boot=True), mm=MagicMock())
+    gsp.nvdev.mm.valloc_cpu_visible.return_value = mapping
+    gsp.rpc_rm_control = MagicMock()
+    desc = types.SimpleNamespace(virt=True, phys=True, size=0x2000)
+
+    self.assertEqual(gsp.promote_ctx(1, 2, 3, {0: desc}), {0: mapping})
+
+    gsp.nvdev.mm.valloc_cpu_visible.assert_called_once_with(0x2000, zero=False)
 
   def test_native_gsp_fini_keeps_existing_fast_unload_behavior(self):
     gsp = object.__new__(NV_GSP)

@@ -66,13 +66,16 @@ class TestCustomASM24Controller(unittest.TestCase):
 
     controller.pcie_mem_write.assert_not_called()
 
-  def test_sram_mmio_write_uses_configured_start_slot(self):
+  def test_sram_mmio_uses_f2_staging_slot(self):
     controller = MagicMock()
-    mmio = USBMMIOInterface(controller, 0xF000, 0x74000, fmt='B', pcimem=False, sram_start_slot=1)
+    controller.scsi_read.return_value = memoryview(b"result")
+    mmio = USBMMIOInterface(controller, 0xF000, 0x1000, fmt='B', pcimem=False, sram_start_slot=5)
 
     mmio.view(size=7)[:] = b"payload"
+    self.assertEqual(bytes(mmio.view(size=6)[:]), b"result")
 
-    controller.scsi_write.assert_called_once_with(b"payload", start_slot=1)
+    controller.scsi_write.assert_called_once_with(b"payload", start_slot=5)
+    controller.scsi_read.assert_called_once_with(6)
     controller.pcie_mem_write.assert_not_called()
 
   def test_scsi_write_arms_each_bulk_transfer(self):
@@ -100,29 +103,6 @@ class TestCustomASM24Controller(unittest.TestCase):
     controller.usb.control_write.assert_called_once_with(0xF5, value=4, index=0x070B)
     self.assertEqual(controller.usb.bulk_write.call_count, 4)
     self.assertEqual([len(call.args[0]) for call in controller.usb.bulk_write.call_args_list], [batch_size] * 4)
-
-  def test_sram_read_uses_f6_for_each_overlapping_sector(self):
-    controller = object.__new__(CustomASM24Controller)
-    controller.usb = MagicMock()
-    controller.usb.bulk_read.return_value = memoryview(bytes([3]) * 512 + bytes([4]) * 512)
-
-    self.assertEqual(controller.sram_read(3 * 0x4000 + 0x610, 0x250), bytes([3]) * 0x1F0 + bytes([4]) * 0x60)
-    controller.usb.control_write.assert_called_once_with(0xF6, value=3, index=0x0203)
-    controller.usb.bulk_read.assert_called_once_with(1024)
-
-    controller.usb.control_write.reset_mock()
-    controller.usb.bulk_read.side_effect = None
-    controller.usb.bulk_read.return_value = memoryview(bytes(0x1000))
-    controller.scsi_read(0x1000)
-    controller.usb.control_write.assert_not_called()
-
-  def test_sram_read_rejects_a_short_sector(self):
-    controller = object.__new__(CustomASM24Controller)
-    controller.usb = MagicMock()
-    controller.usb.bulk_read.return_value = memoryview(bytes(511))
-
-    with self.assertRaisesRegex(RuntimeError, "short read"):
-      controller.sram_read(0, 1)
 
   def test_large_pcie_transfers_are_chunked(self):
     controller = object.__new__(CustomASM24Controller)
@@ -177,8 +157,9 @@ class TestUSBPCIeDiscovery(unittest.TestCase):
   def test_nvidia_device_allows_full_fixed_window_boot_drain(self, flock_acquire, usb3, controller, supports_flr, setup_pcie):
     dev = USBPCIDevice("NV", MagicMock(), "custom v0.1")
 
-    self.assertEqual(dev.gsp_rpc_timeout_ms, 120000)
+    self.assertEqual(dev.gsp_rpc_timeout_ms, 3000)
     self.assertTrue(dev.gsp_full_teardown)
+    self.assertFalse(dev.skip_gsp_registry)
     self.assertTrue(dev.gsp_flr_recovery)
     self.assertFalse(hasattr(dev, "reset_after_gsp_teardown"))
     controller.assert_called_once_with(usb3.return_value)
@@ -351,6 +332,17 @@ class TestUSBPCIeDiscovery(unittest.TestCase):
 
 
 class TestUSBIfaceAllocation(unittest.TestCase):
+  def test_pci_cpu_visible_allocation_forwards_zero_policy(self):
+    iface = object.__new__(PCIIfaceBase)
+    iface.dev, iface.dev_impl, iface.pci_dev, iface.vram_bar = MagicMock(), MagicMock(), MagicMock(), 1
+    iface.is_bar_small = MagicMock(return_value=False)
+    mapping = iface.dev_impl.mm.valloc_cpu_visible.return_value
+    mapping.va_addr, mapping.size, mapping.paddrs = 0x100000, 0x1000, [(0x200000, 0x1000)]
+
+    PCIIfaceBase.alloc(iface, 0x1000, cpu_visible=True, zero=False)
+
+    iface.dev_impl.mm.valloc_cpu_visible.assert_called_once_with(0x1000, uncached=False, zero=False)
+
   def test_host_staging_buffer_gets_bar_view_over_contiguous_vram(self):
     iface = object.__new__(USBIface)
     iface.pci_dev, iface.vram_bar = MagicMock(), 1
@@ -362,7 +354,7 @@ class TestUSBIfaceAllocation(unittest.TestCase):
       self.assertIs(iface.alloc(0x200000, host=True), ret)
 
     alloc.assert_called_once_with(iface, 0x200000, host=False, uncached=False, cpu_access=False,
-                                  contiguous=True, force_devmem=True, cpu_visible=True)
+                                  contiguous=True, force_devmem=True, zero=False, cpu_visible=True)
     iface.pci_dev.map_bar.assert_called_once_with(1, off=0x123000, size=0x200000)
     self.assertIs(ret.view, bar_view)
     self.assertFalse(ret.meta.has_cpu_mapping)
@@ -376,7 +368,7 @@ class TestUSBIfaceAllocation(unittest.TestCase):
       self.assertIs(iface.alloc(0x200000), ret)
 
     alloc.assert_called_once_with(iface, 0x200000, host=False, uncached=False, cpu_access=False,
-                                  contiguous=False, force_devmem=True, cpu_visible=False)
+                                  contiguous=False, force_devmem=True, zero=False, cpu_visible=False)
 
 
 class TestNVAllocatorAllocation(unittest.TestCase):
@@ -386,85 +378,73 @@ class TestNVAllocatorAllocation(unittest.TestCase):
     self.allocator.dev.iface = object.__new__(USBIface)
     self.allocator.dev.iface.alloc = MagicMock()
 
-  def test_usb_host_buffer_retains_default_clear(self):
+  def test_usb_host_staging_buffer_skips_clear(self):
     self.allocator._alloc(0x200000, BufferSpec(host=True))
-    self.allocator.dev.iface.alloc.assert_called_once_with(0x200000, cpu_access=False, host=True)
+    self.allocator.dev.iface.alloc.assert_called_once_with(0x200000, cpu_access=False, host=True, zero=False)
 
-  def test_usb_cpu_access_buffer_retains_default_clear(self):
+  def test_usb_cpu_access_buffer_skips_clear(self):
     self.allocator._alloc(0x1000, BufferSpec(cpu_access=True))
-    self.allocator.dev.iface.alloc.assert_called_once_with(0x1000, cpu_access=True, host=False)
+    self.allocator.dev.iface.alloc.assert_called_once_with(0x1000, cpu_access=True, host=False, zero=False)
 
-  def test_usb_host_cpu_access_buffer_retains_default_clear(self):
+  def test_usb_host_cpu_access_buffer_skips_clear(self):
     self.allocator._alloc(0x1000, BufferSpec(host=True, cpu_access=True))
-    self.allocator.dev.iface.alloc.assert_called_once_with(0x1000, cpu_access=True, host=True)
+    self.allocator.dev.iface.alloc.assert_called_once_with(0x1000, cpu_access=True, host=True, zero=False)
 
   def test_non_usb_host_buffer_retains_default_clear(self):
     self.allocator.dev.iface = MagicMock()
     self.allocator._alloc(0x200000, BufferSpec(host=True))
     self.allocator.dev.iface.alloc.assert_called_once_with(0x200000, cpu_access=False, host=True)
 
-  def test_usb_copyout_chunks_through_sram_and_restores_completion(self):
-    arena_size, prefix_size = ASM24GSPQueueInterface.TRANSFER_SIZE, ASM24GSPQueueInterface.TRANSFER_START_SLOT * 0x4000
+  def test_usb_uses_one_staging_buffer(self):
+    allocator, dev = object.__new__(NVAllocator), MagicMock()
+    dev.iface = object.__new__(USBIface)
+    dev.iface.copy_bufs = [MagicMock()]
+    with patch("tinygrad.runtime.ops_nv.HCQAllocator.__init__", return_value=None) as init:
+      NVAllocator.__init__(allocator, dev)
+    init.assert_called_once_with(dev, copy_bufs=dev.iface.copy_bufs, batch_cnt=1, supports_transfer=False)
+
+  def test_usb_copyout_uses_f2_prefix_and_restores_completion(self):
     stage, source = MagicMock(), MagicMock()
-    stage.size = arena_size
+    stage.size = ASM24GSPQueueInterface.TRANSFER_SIZE
     self.allocator.b = [stage]
     self.allocator.dev.device, self.allocator.dev.hw_copy_queue_t = "NV", MagicMock()
     self.allocator.dev.timeline_value = 7
-    events = []
-    def next_timeline():
-      events.append("next")
-      value = self.allocator.dev.timeline_value
-      self.allocator.dev.timeline_value += 1
-      return value
-    self.allocator.dev.next_timeline.side_effect = next_timeline
+    self.allocator.dev.timeline_signal.wait = MagicMock()
 
     usb, completion, completion_view = MagicMock(), MagicMock(), MagicMock()
     self.allocator.dev.iface.pci_dev, self.allocator.dev.iface.cq_buf = MagicMock(), MagicMock()
     self.allocator.dev.iface.pci_dev.usb = usb
     self.allocator.dev.iface.cq_buf.offset.return_value = completion
-    completion.va_addr, completion.cpu_view.return_value = 0x12345000, completion_view
+    completion.cpu_view.return_value = completion_view
     completion_view.__getitem__.return_value = b"\x04\x00\x00\x00"
 
-    expected = bytes((i * 17 + 3) & 0xff for i in range(arena_size + 17))
-    responses = []
-    for chunk in (expected[:arena_size], expected[arena_size:]):
-      raw = bytes(prefix_size) + chunk
-      responses.append(memoryview(raw + bytes((-len(raw)) % 512)))
-    usb.usb.bulk_read.side_effect = responses
-
-    queues = [MagicMock(), MagicMock()]
-    for queue in queues:
-      queue.wait.return_value = queue
-      queue.copy.return_value = queue
-      queue.write.return_value = queue
-      queue.signal.return_value = queue
-      queue.bind.side_effect = lambda *_: events.append("bind")
-      queue.submit.side_effect = lambda *_: events.append("submit")
+    prefix_size, expected = ASM24GSPQueueInterface.TRANSFER_START_SLOT * ASM24GSPQueueInterface.SLOT_SIZE, bytes(0x1000)
+    read_size = prefix_size + len(expected)
+    usb.usb.bulk_read.return_value = memoryview(bytes(prefix_size) + expected)
+    queue = MagicMock()
+    for method in (queue.wait, queue.copy, queue.write, queue.signal): method.return_value = queue
     result = memoryview(bytearray(len(expected)))
-    with patch("tinygrad.runtime.ops_nv.NVCopyQueue", side_effect=queues), \
+    self.allocator.dev.next_timeline.return_value = 7
+
+    with patch("tinygrad.runtime.ops_nv.NVCopyQueue", return_value=queue), \
          patch("tinygrad.runtime.ops_nv.hcq_profile", return_value=contextlib.nullcontext()):
       self.allocator._copyout(result, source)
 
     self.assertEqual(bytes(result), expected)
-    self.assertEqual(usb.scsi_read_arm.call_args_list,
-                     [unittest.mock.call(prefix_size + arena_size, start_slot=0), unittest.mock.call(prefix_size + 17, start_slot=0)])
-    for queue in queues: queue.write.assert_called_once_with(completion, 0)
-    self.assertEqual(completion_view.__setitem__.call_count, 2)
-    self.assertEqual(events, ["bind", "next", "submit"] * 2)
-    usb.pcie_mem_read.assert_not_called()
-
+    usb.scsi_read_arm.assert_called_once_with(read_size, start_slot=0)
+    usb.usb.bulk_read.assert_called_once_with(read_size, timeout=1000)
+    queue.write.assert_called_once_with(completion, 0)
+    completion_view.__setitem__.assert_called_once_with(slice(None, None, None), b"\x04\x00\x00\x00")
 
 class FakeQueueController:
   def __init__(self):
-    self.sram, self.writes, self.reads = bytearray(ASM24GSPQueueInterface.SRAM_SIZE), [], []
+    self.xdata, self.writes = {}, []
 
-  def sram_read(self, offset, size):
-    self.reads.append((offset, size))
-    return bytes(self.sram[offset:offset+size])
-  def scsi_write(self, data, start_slot=0):
-    offset = start_slot * ASM24GSPQueueInterface.SLOT_SIZE
-    self.sram[offset:offset+len(data)] = data
-    self.writes.append((start_slot, bytes(data)))
+  def read(self, addr, size): return bytes(self.xdata.get(addr+i, 0) for i in range(size))
+  def write(self, addr, data):
+    self.xdata.update((addr+i, x) for i, x in enumerate(data))
+    self.writes.append(("xdata", addr, bytes(data)))
+  def scsi_write(self, data, start_slot=0): self.writes.append(("sram", start_slot, bytes(data)))
 
 
 class TestASM24GSPQueueInterface(unittest.TestCase):
@@ -472,29 +452,26 @@ class TestASM24GSPQueueInterface(unittest.TestCase):
     self.controller = FakeQueueController()
     self.queue = ASM24GSPQueueInterface(self.controller)
 
-  def test_nvidia_compact_page_map_routes_each_queue_region(self):
+  def test_nvidia_fixed_page_map_routes_each_queue_region(self):
     queue = self.queue
     self.assertEqual(queue.paddrs(), list(ASM24GSPQueueInterface.PAGE_PADDRS))
-    self.assertEqual(queue.PAGE_PADDRS[:6], (0x201000, 0x27F000, 0x27B000, 0x27C000, 0x27D000, 0x27E000))
-    self.assertEqual(queue.PAGE_PADDRS[6:], (0x200000, 0x204000, 0x208000, 0x20C000, 0x210000))
-    self.assertEqual(len(set(queue.PAGE_PADDRS[6:])), 5)
-    self.assertEqual((queue.TRANSFER_PADDR, queue.TRANSFER_SIZE), (0x214000, 0x64000))
+    self.assertTrue(queue._reserve_status_credit)
+    self.assertEqual(queue._direct_status_capacity, 2)
+    transfer_lo, transfer_hi = queue.TRANSFER_PADDR, queue.TRANSFER_PADDR + queue.TRANSFER_SIZE
+    self.assertFalse(any(transfer_lo <= paddr < transfer_hi for paddr in queue.PAGE_PADDRS))
 
     queue[0:4] = b"PTES"
     queue.view(0x1000)[0:4] = b"CMDH"
     queue.view(0x2000)[0:4] = b"CMD0"
+    queue.view(0x6000)[0:4] = b"STAH"
+    queue.view(0x7000)[0:4] = b"STA0"
+    queue.view(0x8000)[0:4] = b"STA1"
 
-    self.assertEqual([(write[0], len(write[1])) for write in self.controller.writes], [(0, 0x4000), (31, 0x4000), (30, 0x4000)])
-    self.assertEqual([self.controller.writes[0][1][0x1000:0x1004], self.controller.writes[1][1][0x3000:0x3004],
-                      self.controller.writes[2][1][0x3000:0x3004]],
-                     [b"PTES", b"CMDH", b"CMD0"])
-
-    for logical_offset, paddr, value in ((0x6000, 0x200000, b"STAH"), (0x7000, 0x204000, b"STA0"),
-                                         (0x8000, 0x208000, b"STA1"), (0x9000, 0x20C000, b"STA2"),
-                                         (0xA000, 0x210000, b"STA3")):
-      physical_offset = paddr - queue.SRAM_PADDR
-      self.controller.sram[physical_offset:physical_offset+4] = value
-      self.assertEqual(queue.view(logical_offset)[0:4], value)
-    self.assertEqual(self.controller.reads, [(slot * 0x4000, 4) for slot in range(5)])
+    sram_writes = [write for write in self.controller.writes if write[0] == "sram"]
+    self.assertEqual([(write[1], len(write[2])) for write in sram_writes], [(4, 0x4000), (31, 0x4000), (30, 0x4000)])
+    self.assertEqual((sram_writes[0][2][0x3000:0x3004], sram_writes[1][2][0x3000:0x3004], sram_writes[2][2][0x3000:0x3004]),
+                     (b"PTES", b"CMDH", b"CMD0"))
+    xdata_writes = [write for write in self.controller.writes if write[0] == "xdata"]
+    self.assertEqual(xdata_writes, [("xdata", 0xB800, b"STAH"), ("xdata", 0xA000, b"STA0"), ("xdata", 0xF000, b"STA1")])
 
 if __name__ == "__main__": unittest.main()
