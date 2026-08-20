@@ -9,7 +9,7 @@ class TestNVGSPArguments(unittest.TestCase):
   @staticmethod
   def make_context_gsp():
     gsp = object.__new__(NV_GSP)
-    gsp.nvdev = types.SimpleNamespace(mm=types.SimpleNamespace(valloc_cpu_visible=MagicMock()))
+    gsp.nvdev = types.SimpleNamespace(pci_dev=types.SimpleNamespace(), mm=types.SimpleNamespace(valloc_cpu_visible=MagicMock()))
     gsp.rpc_rm_control = MagicMock()
     return gsp
 
