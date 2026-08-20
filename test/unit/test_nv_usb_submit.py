@@ -1,7 +1,7 @@
 import types, unittest
 from unittest.mock import MagicMock, patch
 
-from tinygrad.runtime.ops_nv import GPFifo, NVCommandQueue, NVCopyQueue, PCIIface
+from tinygrad.runtime.ops_nv import GPFifo, NVCommandQueue, PCIIface
 
 
 class RecordingMMIO:
@@ -31,13 +31,5 @@ class TestNVUSBSubmission(unittest.TestCase):
     iface.device_fini()
 
     iface.dev_impl.fini.assert_called_once_with(iface.root)
-
-  def test_copy_queue_writes_ordered_32_bit_completion(self):
-    queue, target = object.__new__(NVCopyQueue), types.SimpleNamespace(va_addr=0x12345000)
-    queue.binded_device, queue.nvm = None, MagicMock()
-
-    self.assertIs(queue.write(target, 0), queue)
-    self.assertEqual(queue.nvm.call_count, 2)
-    with self.assertRaisesRegex(NotImplementedError, "64-bit"): queue.write(target, 0, b64=True)
 
 if __name__ == "__main__": unittest.main()

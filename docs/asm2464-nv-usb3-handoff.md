@@ -44,25 +44,18 @@ The implementation also:
 
 Observed stress behavior was 303 response records across initialization and 256 repeated RPC wraps: 302 one-page records and one two-page `GSP_RUN_CPU_SEQUENCER` event. No response larger than two pages was observed. A three-page response remains unsupported and may block at the producer before the host can diagnose it.
 
-### F2 tensor transfers
+### BAR1 tensor transfers
 
-Normal tensor data uses F2 and the NVIDIA copy engine, not GSP RPC.
+Normal NVIDIA tensor payloads use BAR1-visible VRAM staging and the NVIDIA copy engine, not GSP RPC or the controller's F2 SRAM path. This deliberately keeps the NVIDIA USB patch close to tinygrad's existing HCQ staging-copy flow.
 
-The GSP page table is at `0x213000`. GSP command pages were moved to `0x27b000` through `0x27f000`, freeing SRAM slots 5 through 29 as a contiguous 400 KiB transfer arena:
-
-```text
-slot 0       folded GSP response page
-slot 4       GSP queue page table
-slots 5-29   400 KiB F2 tensor-transfer arena
-slots 30-31  GSP command header and record pages
-```
+The USB interface allocates three 2 MiB contiguous staging buffers inside the fixed 256 MiB CPU-visible BAR1 region. Host accesses to those buffers use the firmware's F0 streaming PCIe-memory transport.
 
 Host to GPU:
 
 ```text
 host RAM
-  -> USB bulk OUT / F2
-  -> ASM SRAM slots 5-29
+  -> USB F0 streaming PCIe write
+  -> BAR1-visible VRAM staging
   -> NVIDIA copy engine
   -> destination VRAM
 ```
@@ -72,25 +65,20 @@ GPU to host:
 ```text
 source VRAM
   -> NVIDIA copy engine
-  -> ASM SRAM slots 5-29
-  -> ordered zero-dword completion at GPU-visible 0x82800c
-  -> F2 releases USB bulk IN
+  -> BAR1-visible VRAM staging
+  -> USB F0 streaming PCIe read
   -> host RAM
 ```
 
-The completion address overlaps four bytes of the directly visible GSP status header. Tinygrad saves those bytes before each transfer and restores them immediately afterward. Command binding is completed before F2 is armed, so later host bulk writes cannot replace the pending read.
+This path needs no NVIDIA-specific F2 completion buffer, copy-queue `write()` operation, or tensor-transfer firmware extension. F2 remains in use elsewhere by the shared controller and GSP boot transport.
 
-Completion-coupled reads currently work only when F2 is armed from slot 0. Since the payload begins at slot 5, each read contains an 80 KiB prefix which the host discards. F2 is one-shot, so each 400 KiB chunk has its own copy, completion, and USB read cycle.
-
-Set `NV_USB_F2=0` to retain the slower BAR1 staging fallback.
-
-Measured 16 MiB transfers:
+Measured on the rebased Linux tree:
 
 | Path | Host to GPU | GPU to host |
 | --- | ---: | ---: |
-| BAR1 staging | ~3.7 MB/s | ~1.8 MB/s |
-| F2, 192 KiB arena | ~102 MB/s | ~6.3 MB/s |
-| F2, 400 KiB arena | ~138 MB/s | ~12.8 MB/s |
+| BAR1 staging, 16 MiB | ~6.55 MB/s | ~2.18 MB/s |
+
+A warm 4-byte `Tensor.item()` read measured 1.10 ms median across 20 reads (1.08 ms minimum, 1.19 ms maximum). This scalar latency is more representative than bulk throughput for GPU-side LLM sampling.
 
 ## Linux compiler and renderer setup
 
@@ -288,16 +276,16 @@ Do not repeat these unchanged:
 ## Promising next work
 
 1. Run CUDA/NVRTC or PTX/nvJitLink renderers on Linux and measure Tensor Core GEMM throughput over the same USB transport.
-2. Add a backward-compatible firmware request for selected-slot bulk IN. The current F2 handler writes `C429` after starting `C412`; program all source/command fields before starting the DMA engine. Prefer a new advertised vendor request rather than changing existing F2 semantics initially.
-3. If selected-slot reads work, remove the 80 KiB download prefix.
-4. Reduce per-chunk download submission overhead, possibly with pre-bound copy commands or firmware-assisted chained reads.
-5. Keep the folded two-page GSP response transport scoped to the pinned firmware/current tinygrad RPC set unless a genuine additional visible page or arbitrary SRAM read mechanism is found.
+2. Keep any future F2 tensor-transfer optimization as a separate performance change. A backward-compatible selected-slot bulk-IN firmware request would avoid the historical slot-0 prefix.
+3. Measure small BAR1 read latency for inference token sampling separately from bulk transfer throughput.
+4. Keep the folded two-page GSP response transport scoped to the pinned firmware/current tinygrad RPC set unless a genuine additional visible page or arbitrary SRAM read mechanism is found.
 
 ## Current validated state
 
 - GSP initialization is approximately six seconds.
-- 400 KiB F2 upload/download arena is enabled by default.
-- 16 MiB transfer benchmark: approximately 138 MB/s host-to-GPU and 12.8 MB/s GPU-to-host.
+- NVIDIA tensor transfers always use BAR1/F0 staging.
+- 16 MiB BAR1 benchmark: approximately 6.55 MB/s host-to-GPU and 2.18 MB/s GPU-to-host on Linux.
+- Warm 4-byte `Tensor.item()` median: approximately 1.10 ms.
 - Exact compute and 4 MiB round-trip passed.
 - USB3 device/transfer/channel/AER suite passed.
 - Lifecycle/crash recovery suite passed.

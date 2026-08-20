@@ -1,7 +1,6 @@
-import contextlib, unittest
+import unittest
 from unittest.mock import MagicMock, patch
 
-from tinygrad.device import BufferSpec
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.ops_nv import NVAllocator, USBIface
 from tinygrad.runtime.support.system import System, PCIIfaceBase, USBPCIDevice
@@ -372,69 +371,12 @@ class TestUSBIfaceAllocation(unittest.TestCase):
 
 
 class TestNVAllocatorAllocation(unittest.TestCase):
-  def setUp(self):
-    self.allocator = object.__new__(NVAllocator)
-    self.allocator.dev = MagicMock()
-    self.allocator.dev.iface = object.__new__(USBIface)
-    self.allocator.dev.iface.alloc = MagicMock()
-
-  def test_usb_host_staging_buffer_skips_clear(self):
-    self.allocator._alloc(0x200000, BufferSpec(host=True))
-    self.allocator.dev.iface.alloc.assert_called_once_with(0x200000, cpu_access=False, host=True, zero=False)
-
-  def test_usb_cpu_access_buffer_skips_clear(self):
-    self.allocator._alloc(0x1000, BufferSpec(cpu_access=True))
-    self.allocator.dev.iface.alloc.assert_called_once_with(0x1000, cpu_access=True, host=False, zero=False)
-
-  def test_usb_host_cpu_access_buffer_skips_clear(self):
-    self.allocator._alloc(0x1000, BufferSpec(host=True, cpu_access=True))
-    self.allocator.dev.iface.alloc.assert_called_once_with(0x1000, cpu_access=True, host=True, zero=False)
-
-  def test_non_usb_host_buffer_retains_default_clear(self):
-    self.allocator.dev.iface = MagicMock()
-    self.allocator._alloc(0x200000, BufferSpec(host=True))
-    self.allocator.dev.iface.alloc.assert_called_once_with(0x200000, cpu_access=False, host=True)
-
-  def test_usb_uses_one_staging_buffer(self):
+  def test_usb_uses_three_bar1_staging_buffers(self):
     allocator, dev = object.__new__(NVAllocator), MagicMock()
     dev.iface = object.__new__(USBIface)
-    dev.iface.copy_bufs = [MagicMock()]
     with patch("tinygrad.runtime.ops_nv.HCQAllocator.__init__", return_value=None) as init:
       NVAllocator.__init__(allocator, dev)
-    init.assert_called_once_with(dev, copy_bufs=dev.iface.copy_bufs, batch_cnt=1, supports_transfer=False)
-
-  def test_usb_copyout_uses_f2_prefix_and_restores_completion(self):
-    stage, source = MagicMock(), MagicMock()
-    stage.size = ASM24GSPQueueInterface.TRANSFER_SIZE
-    self.allocator.b = [stage]
-    self.allocator.dev.device, self.allocator.dev.hw_copy_queue_t = "NV", MagicMock()
-    self.allocator.dev.timeline_value = 7
-    self.allocator.dev.timeline_signal.wait = MagicMock()
-
-    usb, completion, completion_view = MagicMock(), MagicMock(), MagicMock()
-    self.allocator.dev.iface.pci_dev, self.allocator.dev.iface.cq_buf = MagicMock(), MagicMock()
-    self.allocator.dev.iface.pci_dev.usb = usb
-    self.allocator.dev.iface.cq_buf.offset.return_value = completion
-    completion.cpu_view.return_value = completion_view
-    completion_view.__getitem__.return_value = b"\x04\x00\x00\x00"
-
-    prefix_size, expected = ASM24GSPQueueInterface.TRANSFER_START_SLOT * ASM24GSPQueueInterface.SLOT_SIZE, bytes(0x1000)
-    read_size = prefix_size + len(expected)
-    usb.usb.bulk_read.return_value = memoryview(bytes(prefix_size) + expected)
-    queue = MagicMock()
-    for method in (queue.wait, queue.copy, queue.write, queue.signal): method.return_value = queue
-    result = memoryview(bytearray(len(expected)))
-    self.allocator.dev.next_timeline.return_value = 7
-
-    with patch("tinygrad.runtime.ops_nv.NVCopyQueue", return_value=queue), \
-         patch("tinygrad.runtime.ops_nv.hcq_profile", return_value=contextlib.nullcontext()):
-      self.allocator._copyout(result, source)
-
-    self.assertEqual(bytes(result), expected)
-    usb.scsi_read_arm.assert_called_once_with(read_size, start_slot=0)
-    usb.usb.bulk_read.assert_called_once_with(read_size, timeout=1000)
-    queue.write.assert_called_once_with(completion, 0)
-    completion_view.__setitem__.assert_called_once_with(slice(None, None, None), b"\x04\x00\x00\x00")
+    init.assert_called_once_with(dev, batch_cnt=3, supports_transfer=False)
 
 class FakeQueueController:
   def __init__(self):
@@ -457,8 +399,6 @@ class TestASM24GSPQueueInterface(unittest.TestCase):
     self.assertEqual(queue.paddrs(), list(ASM24GSPQueueInterface.PAGE_PADDRS))
     self.assertTrue(queue._reserve_status_credit)
     self.assertEqual(queue._direct_status_capacity, 2)
-    transfer_lo, transfer_hi = queue.TRANSFER_PADDR, queue.TRANSFER_PADDR + queue.TRANSFER_SIZE
-    self.assertFalse(any(transfer_lo <= paddr < transfer_hi for paddr in queue.PAGE_PADDRS))
 
     queue[0:4] = b"PTES"
     queue.view(0x1000)[0:4] = b"CMDH"
